@@ -15,7 +15,7 @@ then sums those partials into the final scalar.
 
 Two-pass design:
   Pass 1 — grid of ceil(n / BLOCK_SIZE) blocks, each producing one partial sum
-  Pass 2 — single block sums the partials (num_blocks ≤ BLOCK_SIZE assumed)
+  Pass 2 — single block sums the partials; BLOCK_SIZE = next_power_of_2(num_blocks)
 
 Memory traffic: 1 read of x (n × dtype bytes) + negligible scratch I/O.
 Metric: GB/s = (n × element_size × 1e-9) / (ms × 1e-3)
@@ -72,13 +72,11 @@ def reduce_sum(x: torch.Tensor) -> torch.Tensor:
     partials = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
     reduce_sum_kernel[(num_blocks,)](x, partials, n, BLOCK_SIZE=BLOCK_SIZE)
 
-    # Pass 2: sum the partials (single block; num_blocks <= BLOCK_SIZE)
-    assert num_blocks <= BLOCK_SIZE, (
-        f"n={n} requires {num_blocks} blocks > BLOCK_SIZE={BLOCK_SIZE}; "
-        "add a third pass or increase BLOCK_SIZE."
-    )
+    # Pass 2: sum the partials in a single block.
+    # next_power_of_2 gives a valid tl.constexpr that covers all partials.
+    block2 = triton.next_power_of_2(num_blocks)
     out = torch.empty(1, device=x.device, dtype=torch.float32)
-    reduce_partials_kernel[(1,)](partials, out, num_blocks, BLOCK_SIZE=BLOCK_SIZE)
+    reduce_partials_kernel[(1,)](partials, out, num_blocks, BLOCK_SIZE=block2)
 
     return out[0].to(x.dtype)
 
