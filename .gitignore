@@ -46,3 +46,10 @@ benchmarks/results/**/*.csv
 
 # Project conventions (local only — not for public sharing)
 CLAUDE.md
+current_state.md
+
+# images
+images/
+*.png
+*.jpg
+*.jpeg
