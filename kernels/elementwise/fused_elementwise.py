@@ -125,20 +125,30 @@ def test_fused_elementwise():
 
 # ── 4. Benchmarks ─────────────────────────────────────────────────────────────
 #
+# Three-way comparison:
+#   - Triton fused:        our hand-written kernel (1 pass, 3n bytes)
+#   - PyTorch unfused:     two separate ops (2 passes, 5n bytes)
+#   - torch.compile fused: TorchInductor auto-fuses into a Triton kernel
+#
 # Metric: effective GB/s using minimum possible data movement (3n bytes).
-# The unfused PyTorch baseline moves 5n bytes under the hood, so its
-# effective GB/s (by this measure) will be lower — showing the fusion gain.
+# Unfused PyTorch moves 5n bytes; its effective GB/s will be ~3/5 of fused.
 
-def _make_benchmark(triton_fn, torch_fn, name):
+# torch.compile fuses the bias_add + activation into one kernel automatically.
+_compiled_bias_relu = torch.compile(lambda x, b: torch.relu(x + b))
+_compiled_bias_gelu = torch.compile(lambda x, b: F.gelu(x + b, approximate="tanh"))
+_compiled_bias_silu = torch.compile(lambda x, b: F.silu(x + b))
+
+
+def _make_benchmark(triton_fn, torch_fn, compiled_fn, name):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["n"],
             x_vals=[2**i for i in range(12, 28)],
             x_log=True,
             line_arg="provider",
-            line_vals=["triton_fused", "torch_unfused"],
-            line_names=["Triton (fused)", "PyTorch (unfused)"],
-            styles=[("blue", "-"), ("green", "--")],
+            line_vals=["triton_fused", "torch_compiled", "torch_unfused"],
+            line_names=["Triton (fused)", "torch.compile (fused)", "PyTorch (unfused)"],
+            styles=[("blue", "-"), ("orange", "-."), ("green", "--")],
             ylabel="Effective GB/s",
             plot_name=name,
             args={},
@@ -150,13 +160,15 @@ def _make_benchmark(triton_fn, torch_fn, name):
         quantiles = [0.5, 0.2, 0.8]
 
         if provider == "triton_fused":
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: triton_fn(x, bias), warmup=25, rep=100, quantiles=quantiles
-            )
+            fn = lambda: triton_fn(x, bias)
+        elif provider == "torch_compiled":
+            fn = lambda: compiled_fn(x, bias)
         else:
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: torch_fn(x + bias), warmup=25, rep=100, quantiles=quantiles
-            )
+            fn = lambda: torch_fn(x + bias)
+
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            fn, warmup=25, rep=100, quantiles=quantiles
+        )
 
         # 3 tensors × n elements × 4 bytes: 2 reads (x, bias) + 1 write (out)
         gb = 3 * n * x.element_size() * 1e-9
@@ -166,13 +178,13 @@ def _make_benchmark(triton_fn, torch_fn, name):
 
 
 benchmark_fused_bias_relu = _make_benchmark(
-    fused_bias_relu, torch.relu, "fused_bias_relu"
+    fused_bias_relu, torch.relu, _compiled_bias_relu, "fused_bias_relu"
 )
 benchmark_fused_bias_gelu = _make_benchmark(
-    fused_bias_gelu, lambda x: F.gelu(x, approximate="tanh"), "fused_bias_gelu"
+    fused_bias_gelu, lambda x: F.gelu(x, approximate="tanh"), _compiled_bias_gelu, "fused_bias_gelu"
 )
 benchmark_fused_bias_silu = _make_benchmark(
-    fused_bias_silu, F.silu, "fused_bias_silu"
+    fused_bias_silu, F.silu, _compiled_bias_silu, "fused_bias_silu"
 )
 
 
