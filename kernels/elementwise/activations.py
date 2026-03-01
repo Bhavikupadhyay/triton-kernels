@@ -41,9 +41,12 @@ def gelu_kernel(x_ptr, out_ptr, n: int, BLOCK_SIZE: tl.constexpr):
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask)
     # tanh approximation: matches F.gelu(x, approximate='tanh')
+    # tanh via exp: tanh(u) = 2 / (1 + exp(-2u)) - 1
+    # tl.math.tanh doesn't exist; tl.math.exp does
     c = 0.7978845608028654  # sqrt(2 / pi)
     inner = c * (x + 0.044715 * x * x * x)
-    out = 0.5 * x * (1.0 + tl.math.tanh(inner))
+    tanh_inner = 2.0 / (1.0 + tl.math.exp(-2.0 * inner)) - 1.0
+    out = 0.5 * x * (1.0 + tanh_inner)
     tl.store(out_ptr + offs, out, mask=mask)
 
 
