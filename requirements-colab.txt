@@ -1,0 +1,5 @@
+# Colab GPU environment extras
+# torch and numpy are pre-installed in Colab — only install these extras
+triton>=2.3.0
+matplotlib>=3.8.0
+pandas>=2.0.0
