@@ -40,14 +40,15 @@ def gelu_kernel(x_ptr, out_ptr, n: int, BLOCK_SIZE: tl.constexpr):
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask)
+    # tl.math.exp only accepts fp32/fp64 — upcast, compute, cast back
+    x32 = x.to(tl.float32)
     # tanh approximation: matches F.gelu(x, approximate='tanh')
     # tanh via exp: tanh(u) = 2 / (1 + exp(-2u)) - 1
-    # tl.math.tanh doesn't exist; tl.math.exp does
     c = 0.7978845608028654  # sqrt(2 / pi)
-    inner = c * (x + 0.044715 * x * x * x)
+    inner = c * (x32 + 0.044715 * x32 * x32 * x32)
     tanh_inner = 2.0 / (1.0 + tl.math.exp(-2.0 * inner)) - 1.0
-    out = 0.5 * x * (1.0 + tanh_inner)
-    tl.store(out_ptr + offs, out, mask=mask)
+    out = 0.5 * x32 * (1.0 + tanh_inner)
+    tl.store(out_ptr + offs, out.to(x.dtype), mask=mask)
 
 
 @triton.jit
@@ -56,9 +57,11 @@ def silu_kernel(x_ptr, out_ptr, n: int, BLOCK_SIZE: tl.constexpr):
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask)
+    # tl.math.exp only accepts fp32/fp64 — upcast, compute, cast back
+    x32 = x.to(tl.float32)
     # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    out = x / (1.0 + tl.math.exp(-x))
-    tl.store(out_ptr + offs, out, mask=mask)
+    out = x32 / (1.0 + tl.math.exp(-x32))
+    tl.store(out_ptr + offs, out.to(x.dtype), mask=mask)
 
 
 # ── 2. Python wrappers ────────────────────────────────────────────────────────
