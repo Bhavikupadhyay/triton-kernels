@@ -20,15 +20,17 @@ import math
 def fft_kernel(
     re_ptr, im_ptr,          # input:  real and imaginary parts (fp32, [B, N])
     out_re_ptr, out_im_ptr,  # output: real and imaginary parts (fp32, [B, N])
-    N: tl.constexpr,         # FFT size — must be power of 2
-    LOG2_N: tl.constexpr,    # = int(math.log2(N)), computed in the wrapper
+    N: tl.constexpr,         # FFT size — must be power of 2, <= 8192
     BLOCK_SIZE: tl.constexpr,  # == N
 ):
     """
-    One program per batch row. All log2(N) butterfly stages run in registers.
-    LOG2_N is passed from the wrapper as a plain Python int so tl.static_range
-    receives a true constexpr — computing it inside the kernel via math.log2(N)
-    can produce an int32 tensor instead of a Python int in some Triton versions.
+    One program per batch row. All log2(N) butterfly stages in global memory.
+
+    Loop strategy: tl.static_range(13) unrolls 13 iterations at compile time.
+    Each iteration uses a Python-level `if (1 << b) < N:` guard — since both
+    sides are Python ints at trace time (literal shift of a static loop var,
+    constexpr N), Triton evaluates the branch at compile time and emits code
+    only for active stages. No constexpr arithmetic inside the kernel needed.
     """
     batch_id = tl.program_id(0)
 
@@ -42,17 +44,17 @@ def fft_kernel(
     im = tl.load(im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
 
     # ── Bit-reversal permutation ──────────────────────────────────────────────
-    # LOG2_N is a plain Python int (passed as constexpr from wrapper).
-    # tl.static_range(LOG2_N) unrolls exactly LOG2_N iterations at compile time.
-    log2_N = LOG2_N
-
+    # tl.static_range(13) unrolls 13 iterations at compile time; b is a Python
+    # int literal at each step. (1 << b) < N is a Python bool → compile-time
+    # branch; inactive bits (b >= log2_N) generate no code.
     rev = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     src = offs.to(tl.int32)
 
-    for b in tl.static_range(log2_N):  # exactly log2(N) unrolled iterations
-        bit_val = src & 1
-        rev = (rev << 1) | bit_val
-        src = src >> 1
+    for b in tl.static_range(13):     # covers N up to 2^13 = 8192
+        if (1 << b) < N:              # Python bool evaluated at compile time
+            bit_val = src & 1
+            rev = (rev << 1) | bit_val
+            src = src >> 1
 
     # Gather: re_br[rev[i]] = re[i]  →  re_br[i] = re[rev^{-1}[i]]
     # Since bit-reversal is its own inverse, re_br[i] = re[rev[i]].
@@ -70,40 +72,38 @@ def fft_kernel(
     tl.store(out_re_ptr + base + offs, re_br, mask=mask)
     tl.store(out_im_ptr + base + offs, im_br, mask=mask)
 
-    # Butterfly loop: exactly log2_N stages (compile-time constant, fully unrolled)
-    for s in tl.static_range(log2_N):
-        half = 1 << s          # Python int: half-span = 2^s
-        span = half << 1       # Python int: full span = 2^(s+1)
+    # Butterfly loop: 13 unrolled iterations; `if half < N` skips inactive stages
+    for s in tl.static_range(13):
+        half = 1 << s              # Python int at compile time
+        if half < N:               # Python bool at compile time — no tensor involved
+            span = half << 1
 
-        # Which "half" of its butterfly group is each lane in?
-        pos = offs % span
-        is_top = pos < half
+            pos = offs % span
+            is_top = pos < half
+            partner = tl.where(is_top, offs + half, offs - half)
 
-        # Partner index
-        partner = tl.where(is_top, offs + half, offs - half)
+            # Twiddle W = exp(-2πi * k / span), k = position within the half-group
+            k = tl.where(is_top, pos, pos - half).to(tl.float32)
+            angle = -2.0 * math.pi * k / float(span)
+            w_re = tl.cos(angle)
+            w_im = tl.sin(angle)
 
-        # Twiddle factor: W_N^k = exp(-2πi * k / span), k = position within half
-        k = tl.where(is_top, pos, pos - half).to(tl.float32)
-        angle = -2.0 * math.pi * k / float(span)  # float(span): Python int → float
-        w_re = tl.cos(angle)
-        w_im = tl.sin(angle)
+            # Load this stage's values
+            cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+            par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
 
-        # Load current and partner values from the scratch buffer
-        cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
-        par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+            # Twiddle * partner
+            tw_re = w_re * par_re - w_im * par_im
+            tw_im = w_re * par_im + w_im * par_re
 
-        # Complex multiply: twiddle * partner
-        tw_re = w_re * par_re - w_im * par_im
-        tw_im = w_re * par_im + w_im * par_re
+            # Butterfly: top = cur + tw,  bottom = cur - tw
+            new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
+            new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
 
-        # Butterfly: top = cur + tw,  bottom = cur - tw
-        new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
-        new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
-
-        tl.store(out_re_ptr + base + offs, new_re, mask=mask)
-        tl.store(out_im_ptr + base + offs, new_im, mask=mask)
+            tl.store(out_re_ptr + base + offs, new_re, mask=mask)
+            tl.store(out_im_ptr + base + offs, new_im, mask=mask)
 
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────
@@ -135,14 +135,11 @@ def fft(x: torch.Tensor) -> torch.Tensor:
     out_re = torch.empty_like(x)
     out_im = torch.empty_like(x)
 
-    log2_n = int(math.log2(N))  # plain Python int — safe to pass as constexpr
-
     grid = (B,)
     fft_kernel[grid](
         re, im,
         out_re, out_im,
         N=N,
-        LOG2_N=log2_n,
         BLOCK_SIZE=N,
     )
 
