@@ -18,15 +18,17 @@ import math
 
 @triton.jit
 def fft_kernel(
-    re_ptr, im_ptr,       # input:  real and imaginary parts (fp32, [B, N])
+    re_ptr, im_ptr,          # input:  real and imaginary parts (fp32, [B, N])
     out_re_ptr, out_im_ptr,  # output: real and imaginary parts (fp32, [B, N])
-    N: tl.constexpr,     # FFT size — must be power of 2
-    BLOCK_SIZE: tl.constexpr,  # == N (one program handles one row)
+    N: tl.constexpr,         # FFT size — must be power of 2
+    LOG2_N: tl.constexpr,    # = int(math.log2(N)), computed in the wrapper
+    BLOCK_SIZE: tl.constexpr,  # == N
 ):
     """
     One program per batch row. All log2(N) butterfly stages run in registers.
-    Requires N == BLOCK_SIZE to fit the entire row in one program's register file.
-    Valid for N up to ~8192 on T4 (register pressure becomes the limit above that).
+    LOG2_N is passed from the wrapper as a plain Python int so tl.static_range
+    receives a true constexpr — computing it inside the kernel via math.log2(N)
+    can produce an int32 tensor instead of a Python int in some Triton versions.
     """
     batch_id = tl.program_id(0)
 
@@ -40,10 +42,9 @@ def fft_kernel(
     im = tl.load(im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
 
     # ── Bit-reversal permutation ──────────────────────────────────────────────
-    # Cooley-Tukey DIT requires bit-reversed input order.
-    # N is tl.constexpr, so int(math.log2(N)) is a Python int at compile time.
-    # tl.static_range(log2_N) then unrolls exactly log2_N iterations — no guard.
-    log2_N = int(math.log2(N))
+    # LOG2_N is a plain Python int (passed as constexpr from wrapper).
+    # tl.static_range(LOG2_N) unrolls exactly LOG2_N iterations at compile time.
+    log2_N = LOG2_N
 
     rev = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     src = offs.to(tl.int32)
@@ -134,11 +135,14 @@ def fft(x: torch.Tensor) -> torch.Tensor:
     out_re = torch.empty_like(x)
     out_im = torch.empty_like(x)
 
+    log2_n = int(math.log2(N))  # plain Python int — safe to pass as constexpr
+
     grid = (B,)
     fft_kernel[grid](
         re, im,
         out_re, out_im,
         N=N,
+        LOG2_N=log2_n,
         BLOCK_SIZE=N,
     )
 
