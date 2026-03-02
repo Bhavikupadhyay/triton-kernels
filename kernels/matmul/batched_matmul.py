@@ -190,8 +190,43 @@ def benchmark_batched_matmul(B_sz, N, provider):
     return tflops / (ms * 1e-3), tflops / (max_ms * 1e-3), tflops / (min_ms * 1e-3)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["N"],
+        x_vals=[256, 512, 1024, 2048, 4096],
+        x_log=True,
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton (batched)", "PyTorch (bmm)"],
+        styles=[("blue", "-"), ("green", "--")],
+        ylabel="TFLOPS",
+        plot_name="batched_matmul_steady",
+        args={"B_sz": 16},
+    )
+)
+def benchmark_batched_matmul_steady(B_sz, N, provider):
+    """Same as benchmark_batched_matmul — run immediately after to capture
+    steady-state numbers once the autotuner cache is populated."""
+    A = torch.randn(B_sz, N, N, device="cuda", dtype=torch.float32)
+    B = torch.randn(B_sz, N, N, device="cuda", dtype=torch.float32)
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "triton":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: batched_matmul(A, B), warmup=25, rep=100, quantiles=quantiles
+        )
+    else:
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: torch.bmm(A, B), warmup=25, rep=100, quantiles=quantiles
+        )
+
+    tflops = 2 * B_sz * N * N * N * 1e-12
+    return tflops / (ms * 1e-3), tflops / (max_ms * 1e-3), tflops / (min_ms * 1e-3)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     test_batched_matmul()
     benchmark_batched_matmul.run(print_data=True, show_plots=True)
+    benchmark_batched_matmul_steady.run(print_data=True, show_plots=True)
