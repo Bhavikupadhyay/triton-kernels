@@ -59,7 +59,7 @@ def naive_matmul_kernel(
     # fp32 accumulator for this output tile
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k in range(0, triton.cdiv(K, BLOCK_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
         rk = k * BLOCK_K + tl.arange(0, BLOCK_K)
 
         # Load A tile (BLOCK_M, BLOCK_K) — cold HBM read every iteration
