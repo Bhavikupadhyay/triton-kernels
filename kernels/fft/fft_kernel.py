@@ -44,17 +44,17 @@ def fft_kernel(
     im = tl.load(im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
 
     # ── Bit-reversal permutation ──────────────────────────────────────────────
-    # tl.static_range(13) unrolls 13 iterations at compile time; b is a Python
-    # int literal at each step. (1 << b) < N is a Python bool → compile-time
-    # branch; inactive bits (b >= log2_N) generate no code.
+    # N is a Python int inside @triton.jit (proven: N.to() fails with 'int' error).
+    # N.bit_length() - 1 == log2(N) for powers of 2, entirely Python at compile time.
+    # tl.constexpr(python_int) satisfies tl.static_range's isinstance(end, constexpr).
+    LOG2_N = N.bit_length() - 1                    # Python int at compile time
     rev = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     src = offs.to(tl.int32)
 
-    for b in tl.static_range(13):     # covers N up to 2^13 = 8192
-        if (1 << b) < N:              # Python bool evaluated at compile time
-            bit_val = src & 1
-            rev = (rev << 1) | bit_val
-            src = src >> 1
+    for b in tl.static_range(tl.constexpr(LOG2_N)):  # exactly log2(N) iterations
+        bit_val = src & 1
+        rev = (rev << 1) | bit_val
+        src = src >> 1
 
     # Gather: re_br[rev[i]] = re[i]  →  re_br[i] = re[rev^{-1}[i]]
     # Since bit-reversal is its own inverse, re_br[i] = re[rev[i]].
@@ -72,38 +72,39 @@ def fft_kernel(
     tl.store(out_re_ptr + base + offs, re_br, mask=mask)
     tl.store(out_im_ptr + base + offs, im_br, mask=mask)
 
-    # Butterfly loop: 13 unrolled iterations; `if half < N` skips inactive stages
-    for s in tl.static_range(13):
-        half = 1 << s              # Python int at compile time
-        if half < N:               # Python bool at compile time — no tensor involved
-            span = half << 1
+    # Butterfly loop: exactly log2(N) iterations (no if-guard needed)
+    for s in tl.static_range(tl.constexpr(LOG2_N)):
+        half = 1 << s          # Python int (s from static_range)
+        span = half << 1       # Python int
 
-            pos = offs % span
-            is_top = pos < half
-            partner = tl.where(is_top, offs + half, offs - half)
+        pos = offs % span
+        is_top = pos < half
+        partner = tl.where(is_top, offs + half, offs - half)
 
-            # Twiddle W = exp(-2πi * k / span), k = position within the half-group
-            k = tl.where(is_top, pos, pos - half).to(tl.float32)
-            angle = -2.0 * math.pi * k / float(span)
-            w_re = tl.cos(angle)
-            w_im = tl.sin(angle)
+        # Twiddle angle: compute scale as a pure Python float BEFORE any tensor ops.
+        # half and span are Python ints at this point → no tensor conversion needed.
+        k = tl.where(is_top, pos, pos - half).to(tl.float32)
+        scale = -2.0 * math.pi / span   # Python float / Python int → Python float
+        angle = scale * k               # Python float × fp32 tensor → fp32 tensor
+        w_re = tl.cos(angle)
+        w_im = tl.sin(angle)
 
-            # Load this stage's values
-            cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-            cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-            par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
-            par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+        # Load this stage's values
+        cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+        par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
 
-            # Twiddle * partner
-            tw_re = w_re * par_re - w_im * par_im
-            tw_im = w_re * par_im + w_im * par_re
+        # Twiddle * partner
+        tw_re = w_re * par_re - w_im * par_im
+        tw_im = w_re * par_im + w_im * par_re
 
-            # Butterfly: top = cur + tw,  bottom = cur - tw
-            new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
-            new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
+        # Butterfly: top = cur + tw,  bottom = cur - tw
+        new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
+        new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
 
-            tl.store(out_re_ptr + base + offs, new_re, mask=mask)
-            tl.store(out_im_ptr + base + offs, new_im, mask=mask)
+        tl.store(out_re_ptr + base + offs, new_re, mask=mask)
+        tl.store(out_im_ptr + base + offs, new_im, mask=mask)
 
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────
