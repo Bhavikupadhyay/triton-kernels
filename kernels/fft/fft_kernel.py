@@ -41,31 +41,17 @@ def fft_kernel(
 
     # ── Bit-reversal permutation ──────────────────────────────────────────────
     # Cooley-Tukey DIT requires bit-reversed input order.
-    # We compute the bit-reversed index for each position and gather.
-    # Triton has no dynamic gather, so we implement iterative bit-reversal
-    # via the standard shift-based algorithm unrolled across log2(N) steps.
-    #
-    # Strategy: build rev[i] by iterating bits. Since N is constexpr we unroll.
-    # We use a register-level approach: copy re/im into bit-reversed positions
-    # by swapping pairs that are out of place.
-    #
-    # A cleaner Triton idiom: compute rev_idx via arithmetic, use tl.load with
-    # explicit pointer arithmetic for the gather.
-    log2_N = tl.log2(N.to(tl.float32)).to(tl.int32)
+    # N is tl.constexpr, so int(math.log2(N)) is a Python int at compile time.
+    # tl.static_range(log2_N) then unrolls exactly log2_N iterations — no guard.
+    log2_N = int(math.log2(N))
 
-    # Compute bit-reversed indices using iterative bit swap
     rev = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    src = offs  # [0, 1, 2, ..., N-1]
+    src = offs.to(tl.int32)
 
-    # Unroll bit-reversal: for each bit position b in [0, log2_N),
-    # accumulate the reversed bit into rev.
-    # We need constexpr loop count — use the maximum possible (13 for N=8192)
-    # and guard with runtime check.
-    for b in tl.static_range(13):  # covers N up to 2^13 = 8192
-        bit_on = (b < log2_N)
+    for b in tl.static_range(log2_N):  # exactly log2(N) unrolled iterations
         bit_val = src & 1
-        rev = tl.where(bit_on, (rev << 1) | bit_val, rev)
-        src = tl.where(bit_on, src >> 1, src)
+        rev = (rev << 1) | bit_val
+        src = src >> 1
 
     # Gather: re_br[rev[i]] = re[i]  →  re_br[i] = re[rev^{-1}[i]]
     # Since bit-reversal is its own inverse, re_br[i] = re[rev[i]].
@@ -73,68 +59,50 @@ def fft_kernel(
     im_br = tl.load(im_ptr + base + rev, mask=mask, other=0.0).to(tl.float32)
 
     # ── Butterfly stages ──────────────────────────────────────────────────────
-    # Stage s has butterfly span = 2^s.
-    # For each group of 2^s elements, the first half are "even" (top) and
-    # the second half are "odd" (bottom). Twiddle W = exp(-2πi * k / 2^s).
+    # Stage s has butterfly span = 2^(s+1), half-span = 2^s.
+    # All N butterflies in a stage run in parallel (one lane per element).
+    # Lanes communicate through global memory: each stage reads out_{re,im}
+    # written by the previous stage. This costs 2 × log2(N) HBM round-trips
+    # total — more than cuFFT's shared-memory approach, but correct.
     #
-    # Triton has no inter-lane communication (no shuffle/warp intrinsics).
-    # We compute all N butterflies per stage in parallel using arithmetic on
-    # the full register arrays — each lane computes its own output by reading
-    # its partner's value from the same register array.
-    #
-    # This works because in Triton, all BLOCK_SIZE lanes share the same
-    # register arrays re_br/im_br and can index them freely with tl.load
-    # from scratch pointers — but we cannot do live register-to-register
-    # communication without going through SRAM (shared memory).
-    #
-    # Implementation: iterate stages; for each stage write to output scratch,
-    # then use that as next stage's input. We ping-pong through global memory
-    # scratch buffers (out_re/out_im) between stages.
-    #
-    # Write bit-reversed input into output buffer as stage-0 starting point.
+    # Write bit-reversed input as stage-0 input.
     tl.store(out_re_ptr + base + offs, re_br, mask=mask)
     tl.store(out_im_ptr + base + offs, im_br, mask=mask)
 
-    # Butterfly loop: log2(N) stages
-    for s in tl.static_range(13):  # unrolled; guarded by s < log2_N
-        do_stage = (s < log2_N)
-        half = 1 << s          # half-span = 2^s
-        span = half << 1       # full span = 2^(s+1)
+    # Butterfly loop: exactly log2_N stages (compile-time constant, fully unrolled)
+    for s in tl.static_range(log2_N):
+        half = 1 << s          # Python int: half-span = 2^s
+        span = half << 1       # Python int: full span = 2^(s+1)
 
         # Which "half" of its butterfly group is each lane in?
-        # group = offs // span;  pos = offs % span
-        # top (even) half: pos < half;  bottom (odd) half: pos >= half
         pos = offs % span
         is_top = pos < half
 
-        # Partner index: top lane's partner is (offs + half), bottom's is (offs - half)
+        # Partner index
         partner = tl.where(is_top, offs + half, offs - half)
 
-        # Twiddle factor index k = pos for top lanes (0..half-1)
+        # Twiddle factor: W_N^k = exp(-2πi * k / span), k = position within half
         k = tl.where(is_top, pos, pos - half).to(tl.float32)
-        angle = -2.0 * math.pi * k / span.to(tl.float32)
+        angle = -2.0 * math.pi * k / float(span)  # float(span): Python int → float
         w_re = tl.cos(angle)
         w_im = tl.sin(angle)
 
-        # Load current stage values
+        # Load current and partner values from the scratch buffer
         cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
         cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
         par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
         par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
 
-        # Twiddle * partner  (complex multiply)
+        # Complex multiply: twiddle * partner
         tw_re = w_re * par_re - w_im * par_im
         tw_im = w_re * par_im + w_im * par_re
 
-        # Butterfly output
-        # top:    X[i]         = cur + twiddle * partner
-        # bottom: X[i + half]  = cur - twiddle * partner
+        # Butterfly: top = cur + tw,  bottom = cur - tw
         new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
         new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
 
-        # Only write if this stage is active (s < log2_N)
-        tl.store(out_re_ptr + base + offs, tl.where(do_stage, new_re, cur_re), mask=mask)
-        tl.store(out_im_ptr + base + offs, tl.where(do_stage, new_im, cur_im), mask=mask)
+        tl.store(out_re_ptr + base + offs, new_re, mask=mask)
+        tl.store(out_im_ptr + base + offs, new_im, mask=mask)
 
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────
