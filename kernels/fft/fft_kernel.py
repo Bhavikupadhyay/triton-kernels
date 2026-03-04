@@ -58,13 +58,22 @@ def butterfly_stage_kernel(
     par_re = tl.load(in_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
     par_im = tl.load(in_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
 
-    # Complex multiply: twiddle × partner
-    tw_re = w_re * par_re - w_im * par_im
-    tw_im = w_re * par_im + w_im * par_re
+    # Resolve even (top-half) and odd (bottom-half) for this butterfly pair.
+    # Top element:    cur=even, par=odd.
+    # Bottom element: cur=odd,  par=even.
+    # Twiddle always multiplies the odd element, so we must select correctly.
+    even_re = tl.where(is_top, cur_re, par_re)
+    even_im = tl.where(is_top, cur_im, par_im)
+    odd_re  = tl.where(is_top, par_re, cur_re)
+    odd_im  = tl.where(is_top, par_im, cur_im)
 
-    # Butterfly: top = cur + tw,  bottom = cur - tw
-    new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
-    new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
+    # Complex multiply: twiddle × odd
+    tw_re = w_re * odd_re - w_im * odd_im
+    tw_im = w_re * odd_im + w_im * odd_re
+
+    # Butterfly: top = even + tw,  bottom = even - tw
+    new_re = tl.where(is_top, even_re + tw_re, even_re - tw_re)
+    new_im = tl.where(is_top, even_im + tw_im, even_im - tw_im)
 
     # Write to out-buffer (disjoint from in-buffer → no intra-stage race)
     tl.store(out_re_ptr + base + offs, new_re, mask=mask)
