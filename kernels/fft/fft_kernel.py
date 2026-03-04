@@ -5,7 +5,6 @@ Complexity: O(N log N) per row
 Memory bound: No — compute bound at large N
 PyTorch equivalent: torch.fft.fft(x)
 References: https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm
-            https://triton-lang.org/main/getting-started/tutorials/
 """
 
 import torch
@@ -17,108 +16,73 @@ import math
 # ── Kernel ────────────────────────────────────────────────────────────────────
 
 @triton.jit
-def fft_kernel(
-    re_ptr, im_ptr,          # input:  real and imaginary parts (fp32, [B, N])
-    out_re_ptr, out_im_ptr,  # output: real and imaginary parts (fp32, [B, N])
-    N: tl.constexpr,         # FFT size — must be power of 2, <= 8192
-    BLOCK_SIZE: tl.constexpr,  # == N
+def butterfly_stage_kernel(
+    in_re_ptr, in_im_ptr,     # read-only input for this stage
+    out_re_ptr, out_im_ptr,   # write-only output for this stage (separate buffer)
+    N,                        # row length (runtime int)
+    half: tl.constexpr,       # half-span = 2^s for stage s; passed from Python
+    angle_scale: tl.constexpr,  # = -2*pi / span; passed from Python as float
+    BLOCK_SIZE: tl.constexpr,   # == N
 ):
     """
-    One program per batch row. All log2(N) butterfly stages in global memory.
+    One Cooley-Tukey butterfly stage. Called log2(N) times from the wrapper.
 
-    Loop strategy: tl.static_range(13) unrolls 13 iterations at compile time.
-    Each iteration uses a Python-level `if (1 << b) < N:` guard — since both
-    sides are Python ints at trace time (literal shift of a static loop var,
-    constexpr N), Triton evaluates the branch at compile time and emits code
-    only for active stages. No constexpr arithmetic inside the kernel needed.
+    Design rationale:
+    - All loop-bound arithmetic (half, angle_scale) is computed in pure Python
+      in the wrapper and passed as tl.constexpr — no JIT-level math needed.
+    - Separate in/out buffers (ping-pong) avoid the cross-warp race condition
+      that arises when half >= 32 and adjacent butterfly pairs span warp boundaries.
+    - The kernel is recompiled once per unique (half, BLOCK_SIZE) pair, so for
+      N=4096 there are 12 compiled variants — one per stage.
     """
     batch_id = tl.program_id(0)
-
-    # Base pointers for this batch row
     base = batch_id * N
-    offs = tl.arange(0, BLOCK_SIZE)  # [0, N)
+    offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < N
 
-    # Load inputs as fp32
-    re = tl.load(re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-    im = tl.load(im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    # Which butterfly group and which half is this element in?
+    span = half + half                                   # = 2^(s+1), constexpr
+    pos = offs % span                                    # position within group
+    is_top = pos < half                                  # top (even) half?
+    partner = tl.where(is_top, offs + half, offs - half)
 
-    # ── Bit-reversal permutation ──────────────────────────────────────────────
-    # N is a Python int inside @triton.jit (proven: N.to() fails with 'int' error).
-    # N.bit_length() - 1 == log2(N) for powers of 2, entirely Python at compile time.
-    # tl.constexpr(python_int) satisfies tl.static_range's isinstance(end, constexpr).
-    LOG2_N = N.bit_length() - 1                    # Python int at compile time
-    rev = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    src = offs.to(tl.int32)
+    # Twiddle factor W = exp(-2πi * k / span)
+    k = tl.where(is_top, pos, pos - half).to(tl.float32)
+    angle = angle_scale * k   # constexpr float × fp32 tensor → fp32 tensor
+    w_re = tl.cos(angle)
+    w_im = tl.sin(angle)
 
-    for b in tl.static_range(tl.constexpr(LOG2_N)):  # exactly log2(N) iterations
-        bit_val = src & 1
-        rev = (rev << 1) | bit_val
-        src = src >> 1
+    # Load from in-buffer (all loads before any stores → no race between stages)
+    cur_re = tl.load(in_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    cur_im = tl.load(in_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    par_re = tl.load(in_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+    par_im = tl.load(in_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
 
-    # Gather: re_br[rev[i]] = re[i]  →  re_br[i] = re[rev^{-1}[i]]
-    # Since bit-reversal is its own inverse, re_br[i] = re[rev[i]].
-    re_br = tl.load(re_ptr + base + rev, mask=mask, other=0.0).to(tl.float32)
-    im_br = tl.load(im_ptr + base + rev, mask=mask, other=0.0).to(tl.float32)
+    # Complex multiply: twiddle × partner
+    tw_re = w_re * par_re - w_im * par_im
+    tw_im = w_re * par_im + w_im * par_re
 
-    # ── Butterfly stages ──────────────────────────────────────────────────────
-    # Stage s has butterfly span = 2^(s+1), half-span = 2^s.
-    # All N butterflies in a stage run in parallel (one lane per element).
-    # Lanes communicate through global memory: each stage reads out_{re,im}
-    # written by the previous stage. This costs 2 × log2(N) HBM round-trips
-    # total — more than cuFFT's shared-memory approach, but correct.
-    #
-    # Write bit-reversed input as stage-0 input.
-    tl.store(out_re_ptr + base + offs, re_br, mask=mask)
-    tl.store(out_im_ptr + base + offs, im_br, mask=mask)
+    # Butterfly: top = cur + tw,  bottom = cur - tw
+    new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
+    new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
 
-    # Butterfly loop: exactly log2(N) iterations (no if-guard needed)
-    for s in tl.static_range(tl.constexpr(LOG2_N)):
-        half = 1 << s          # Python int (s from static_range)
-        span = half << 1       # Python int
-
-        pos = offs % span
-        is_top = pos < half
-        partner = tl.where(is_top, offs + half, offs - half)
-
-        # Twiddle angle: compute scale as a pure Python float BEFORE any tensor ops.
-        # half and span are Python ints at this point → no tensor conversion needed.
-        k = tl.where(is_top, pos, pos - half).to(tl.float32)
-        scale = -2.0 * math.pi / span   # Python float / Python int → Python float
-        angle = scale * k               # Python float × fp32 tensor → fp32 tensor
-        w_re = tl.cos(angle)
-        w_im = tl.sin(angle)
-
-        # Load this stage's values
-        cur_re = tl.load(out_re_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        cur_im = tl.load(out_im_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        par_re = tl.load(out_re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
-        par_im = tl.load(out_im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
-
-        # Twiddle * partner
-        tw_re = w_re * par_re - w_im * par_im
-        tw_im = w_re * par_im + w_im * par_re
-
-        # Butterfly: top = cur + tw,  bottom = cur - tw
-        new_re = tl.where(is_top, cur_re + tw_re, cur_re - tw_re)
-        new_im = tl.where(is_top, cur_im + tw_im, cur_im - tw_im)
-
-        tl.store(out_re_ptr + base + offs, new_re, mask=mask)
-        tl.store(out_im_ptr + base + offs, new_im, mask=mask)
+    # Write to out-buffer (disjoint from in-buffer → no intra-stage race)
+    tl.store(out_re_ptr + base + offs, new_re, mask=mask)
+    tl.store(out_im_ptr + base + offs, new_im, mask=mask)
 
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────
 
 def fft(x: torch.Tensor) -> torch.Tensor:
     """
-    Compute the 1-D FFT of each row of x using Triton.
+    Compute the 1-D DFT of each row of x using Triton.
 
     Args:
-        x: Real-valued input tensor of shape (B, N) or (N,), fp32 or fp16.
+        x: Real-valued tensor of shape (B, N) or (N,), fp32 or fp16.
            N must be a power of 2, N <= 8192.
 
     Returns:
-        Complex-valued tensor of shape (..., N), dtype=torch.complex64.
+        Complex tensor of shape (..., N), dtype=torch.complex64.
     """
     squeeze = x.dim() == 1
     if squeeze:
@@ -131,47 +95,64 @@ def fft(x: torch.Tensor) -> torch.Tensor:
     assert N > 0 and (N & (N - 1)) == 0, f"N must be a power of 2, got {N}"
     assert N <= 8192, f"N={N} exceeds max supported size (8192)"
 
-    re = x.clone()
-    im = torch.zeros_like(x)
-    out_re = torch.empty_like(x)
-    out_im = torch.empty_like(x)
+    log2_n = int(math.log2(N))
 
+    # ── Bit-reversal permutation (CPU, vectorised) ────────────────────────────
+    # The bit-reversal for a given N is a fixed permutation — compute it once
+    # on CPU and apply with PyTorch advanced indexing.
+    indices = torch.arange(N, dtype=torch.int64)
+    rev = torch.zeros(N, dtype=torch.int64)
+    tmp = indices.clone()
+    for _ in range(log2_n):
+        rev = (rev << 1) | (tmp & 1)
+        tmp = tmp >> 1
+
+    # Apply bit-reversal: buf0 starts as the bit-reversed input
+    buf = [
+        [x[:, rev].contiguous().clone(), torch.zeros(B, N, device=x.device)],
+        [torch.empty(B, N, device=x.device), torch.empty(B, N, device=x.device)],
+    ]
+
+    # ── log2(N) butterfly stages ──────────────────────────────────────────────
+    # Each stage reads from buf[s % 2] and writes to buf[(s+1) % 2].
+    # All arithmetic on half/angle_scale is done in Python (never inside JIT).
     grid = (B,)
-    fft_kernel[grid](
-        re, im,
-        out_re, out_im,
-        N=N,
-        BLOCK_SIZE=N,
-    )
+    for s in range(log2_n):
+        src = s % 2
+        dst = (s + 1) % 2
+        half = 1 << s
+        span = half << 1
+        angle_scale = -2.0 * math.pi / span  # Python float, passed as constexpr
 
-    result = torch.complex(out_re, out_im)
+        butterfly_stage_kernel[grid](
+            buf[src][0], buf[src][1],
+            buf[dst][0], buf[dst][1],
+            N,
+            half=half,
+            angle_scale=angle_scale,
+            BLOCK_SIZE=N,
+        )
+
+    final_re, final_im = buf[log2_n % 2]
+    result = torch.complex(final_re, final_im)
     return result.squeeze(0) if squeeze else result
 
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
 def test_fft():
-    print("Testing fft_kernel...")
+    print("Testing fft (butterfly_stage_kernel)...")
 
-    # Power-of-2 sizes, including non-trivial ones
     for N in [64, 128, 256, 512, 1024, 2048, 4096]:
         x = torch.randn(16, N, device="cuda", dtype=torch.float32)
-
-        ref = torch.fft.fft(x)          # PyTorch reference (cuFFT)
+        ref = torch.fft.fft(x)
         got = fft(x)
-
-        torch.testing.assert_close(
-            got.real, ref.real, atol=1e-3, rtol=1e-3,
-            msg=f"Real mismatch at N={N}"
-        )
-        torch.testing.assert_close(
-            got.imag, ref.imag, atol=1e-3, rtol=1e-3,
-            msg=f"Imag mismatch at N={N}"
-        )
-        print(f"  N={N:5d}  max_err_re={( got.real - ref.real).abs().max():.2e}"
+        torch.testing.assert_close(got.real, ref.real, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(got.imag, ref.imag, atol=1e-3, rtol=1e-3)
+        print(f"  N={N:5d}  max_err_re={(got.real - ref.real).abs().max():.2e}"
               f"  max_err_im={(got.imag - ref.imag).abs().max():.2e}  PASS")
 
-    # Single vector (1-D input)
+    # 1-D input
     x1d = torch.randn(256, device="cuda")
     ref1d = torch.fft.fft(x1d)
     got1d = fft(x1d)
@@ -211,7 +192,6 @@ def benchmark_fft(N, B, provider):
             lambda: torch.fft.fft(x), warmup=25, rep=100, quantiles=quantiles
         )
 
-    # GFLOPS = 5 * N * log2(N) * B / (ms * 1e-3) / 1e9
     gflops = lambda ms: (5 * B * N * math.log2(N) * 1e-9) / (ms * 1e-3)
     return gflops(ms), gflops(max_ms), gflops(min_ms)
 
