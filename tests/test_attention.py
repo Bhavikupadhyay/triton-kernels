@@ -128,3 +128,44 @@ def test_mha_matches_sdpa_single_head():
         q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), is_causal=True
     ).squeeze(1)
     torch.testing.assert_close(mha_out, sdpa_ref, atol=1e-3, rtol=1e-3)
+from kernels.attention.flash_attention_v1 import flash_attention_v1
+
+
+# ── flash_attention_v1 ────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("d", [32, 64])
+@pytest.mark.parametrize("B,H", [(1, 1), (2, 4)])
+def test_flash_v1_shapes(N, d, B, H):
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    got = flash_attention_v1(q, k, v)
+    torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_flash_v1_large_n():
+    """Flash attention should handle N=4096 without OOM (no N^2 materialisation)."""
+    import torch.nn.functional as F
+    B, H, N, d = 1, 4, 4096, 64
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    got = flash_attention_v1(q, k, v)
+    torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_flash_v1_first_token():
+    """Position 0 attends only to itself; output[0] must equal V[0]."""
+    import torch.nn.functional as F
+    B, H, N, d = 1, 1, 256, 64
+    torch.manual_seed(2)
+    q = torch.randn(B, H, N, d, device="cuda")
+    k = torch.randn(B, H, N, d, device="cuda")
+    v = torch.randn(B, H, N, d, device="cuda")
+    got = flash_attention_v1(q, k, v)
+    torch.testing.assert_close(got[0, 0, 0], v[0, 0, 0], atol=1e-3, rtol=1e-3)
