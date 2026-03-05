@@ -30,16 +30,19 @@ Algorithm — 2D-tiled Implicit GEMM with weight transpose:
     BLOCK_W columns per program (pid_w). X load for fixed (c_in, kh, kw):
       x[b, c_in, pid_h + kh, w_offs : w_offs + BLOCK_W]   — always contiguous ✓
 
-  Key insight 3 — tl.static_range(K) with K as constexpr:
-    With K as tl.constexpr, the compiler unrolls the K×K inner iterations at compile
-    time. num_stages then applies across the unrolled body: loads for iteration i+1
-    are issued while computing iteration i (software pipelining). With a dynamic
-    range(K) loop the compiler can't pipeline across kh/kw boundaries, exposing
-    memory latency and dropping throughput ~30-40% on a compute-bound kernel.
-
-    K=5 in the inline test caused 25-dot-call kernels (long compile). Fix: inline
-    test_conv2d() only covers K=3 cases; the K=5 case lives in tests/test_convolution.py
-    for the full pytest run on Colab.
+  Key insight 3 — K as a runtime parameter (NOT tl.constexpr):
+    Making K tl.constexpr and using tl.static_range(K) sounds appealing (the compiler
+    can unroll K² iterations and pipeline loads across them). In practice for K=3 with
+    C_PER_TILE=64, it is counterproductive:
+      • Each of the 9 unrolled iterations holds a live (BLOCK_M, C_PER_TILE) W_sub and
+        a (C_PER_TILE, BLOCK_W) X_sub tile simultaneously → register file saturates,
+        warp occupancy drops, latency hiding disappears.
+      • With large tiles (BLOCK_M=128, BLOCK_W=128, C_PER_TILE=64) the LLVM IR for 9
+        unrolled tensor-core operations is enormous → 30-60 s compile per autotune config
+        → 16+ minute test runs.
+    A runtime K with range(K) keeps only one iteration's tiles live at a time, reducing
+    register pressure and letting the outer c_tile loop pipeline correctly via num_stages.
+    The loop overhead for 9 dynamic iterations is negligible compared to the dot time.
 
   Grid (3D):
     axis 0: cdiv(C_out, BLOCK_M)            — C_out tiles
@@ -102,7 +105,7 @@ def conv2d_kernel(
     stride_xb,  stride_xci, stride_xh,  stride_xw,
     stride_wco, stride_wkh, stride_wkw, stride_wci,   # note: wci LAST (=1 after transpose)
     stride_yb,  stride_yco, stride_yh,  stride_yw,
-    K:          tl.constexpr, # kernel size — constexpr enables tl.static_range + num_stages pipelining
+    K,                        # runtime int — keeps one iteration live at a time; lower register pressure
     BLOCK_M:    tl.constexpr, # tile over C_out
     BLOCK_W:    tl.constexpr, # tile over W_out (output columns per program)
     C_PER_TILE: tl.constexpr, # C_in channels per inner tile; must be ≥ 16 (tl.dot constraint)
@@ -136,10 +139,10 @@ def conv2d_kernel(
         c_in_offs = c_in_base + c_tile_offs
         mask_c    = c_in_offs < C_in
 
-        # K×K kernel positions — fully unrolled; K is constexpr so the compiler
-        # can software-pipeline loads for iteration i+1 during iteration i's dot.
-        for kh in tl.static_range(K):
-            for kw in tl.static_range(K):
+        # K×K kernel positions — dynamic loop. K is runtime so only one tile pair
+        # (W_sub, X_sub) is live per iteration; avoids register explosion from unrolling.
+        for kh in range(K):
+            for kw in range(K):
 
                 # ── W_sub : (BLOCK_M, C_PER_TILE) ───────────────────────────
                 # w_t[m_offs[m], kh, kw, c_in_offs[c]]
