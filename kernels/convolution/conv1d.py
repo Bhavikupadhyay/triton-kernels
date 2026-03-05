@@ -13,26 +13,49 @@ Layout:
   weight : (C_out, C_in, K)   — output channels, input channels, kernel size
   y      : (B, C_out, N_out)  — N_out = N - K + 1  (valid convolution, no padding)
 
-Parallelism — 2D output tile:
-  One program per (b, c_out_block, n_out_block).
+Algorithm — implicit GEMM via tl.dot:
+  Convolution is equivalent to a batched matrix multiply:
+    Y[b] = W_flat @ X_col[b]
+  where  W_flat : (C_out, C_in × K)           — weight reshaped
+         X_col  : (C_in × K, N_out)           — im2col view of x (virtualised, not materialised)
+
+  Instead of materialising X_col (470 MB for C_in=128, K=7, N=131K), the kernel streams
+  it one c_in slice at a time. For each c_in the slice contributes a (K, N_out) sub-block:
+    X_col[c_in*K : (c_in+1)*K, n_out] = x[b, c_in, n_out + k]   for k=0..K-1
+
+  This sub-block IS contiguous in the N dimension — x[b, c_in, n_start+k : n_start+k+BLOCK_N_OUT]
+  for k=0..K-1 — so each row can be loaded as a single coalesced vector load.
+
+  One Triton program per (b, c_out_block, n_out_block).
   Grid: (B × cdiv(C_out, BLOCK_C_OUT), cdiv(N_out, BLOCK_N_OUT))
 
-Accumulation (per program):
-  Outer loop: for c_in in [0, C_in)                 ← runtime, pipelined via num_stages
-  Inner loop: for k in tl.static_range(K)           ← constexpr → fully unrolled by LLVM
-    x_val  ← x[b, c_in, offs_n + k]                  (BLOCK_N_OUT,) — shared across c_out
-    w_val  ← w[offs_cout, c_in, k]                    (BLOCK_C_OUT,) — one weight per c_out
-    acc   += w_val[:, None] * x_val[None, :]           outer product → (BLOCK_C_OUT, BLOCK_N_OUT)
+  Inner loop (128 iterations over C_in, not 128*K = 896):
+    W_tile : (BLOCK_C_OUT, K_PAD) from weight   — one K-wide row per c_out in block
+    X_tile : (K_PAD, BLOCK_N_OUT) from x        — K rows of BLOCK_N_OUT consecutive elements
+    acc    = tl.dot(W_tile, X_tile, acc=acc)    — (BLOCK_C_OUT, BLOCK_N_OUT) GEMM step
 
-  Why K must be constexpr: with K as a runtime int, `for k in range(K)` compiles to a
-  GPU loop with a branch on every iteration. The 7 independent x-loads (for k=0..6 at
-  a fixed c_in) are serialised behind the loop counter — the compiler cannot pipeline
-  them. With K as constexpr, tl.static_range(K) unrolls all K iterations into independent
-  instructions; LLVM can issue all K loads simultaneously, hiding global memory latency
-  and recovering the throughput that the loop overhead was stealing.
+  K_PAD = max(16, next_power_of_2(K)) — tl.dot requires the inner dimension ≥ 16.
+  Positions k≥K are zero-masked in both tiles so they don't contribute to the result.
 
-  Mask on offs_n < N_out is sufficient to keep offs_n + k in-bounds on x:
-    offs_n + k ≤ (N_out − 1) + (K − 1) = N − 1.
+  Why tl.dot beats the outer-product loop:
+    - The outer product `w_val[:, None] * x_val[None, :]` requires Triton to distribute
+      a (BLOCK_C_OUT,) and a (BLOCK_N_OUT,) vector across threads for every (c_in, k)
+      iteration. At 896 iterations the broadcast overhead dominates.
+    - tl.dot maps to hardware-optimised register blocking: each thread holds a small
+      submatrix of acc and re-uses W_tile / X_tile elements from registers across the
+      K_PAD inner steps. Memory traffic per iteration drops; ILP rises.
+    - The C_in loop (128 iters) is software-pipelined via num_stages: next c_in's loads
+      are issued while current c_in's dot product executes.
+
+  For K=7 and K_PAD=16: 9/16 inner dot-product slots are zero — we "waste" 56% of
+  the arithmetic in each tl.dot call. On T4 (fp32, no fp32 tensor cores) tl.dot still
+  uses FP32 FMA units, but with optimal register blocking. This beats 896 serial loop
+  iterations even with the padding waste.
+
+  Remaining gap vs PyTorch (cuDNN implicit GEMM): cuDNN reads x exactly once from HBM
+  across all C_out programs; our kernel reads x cdiv(C_out, BLOCK_C_OUT) times.
+  Closing this fully requires a true implicit GEMM with shared HBM reads across the
+  entire C_out dimension — beyond the scope of a direct-convolution baseline.
 
 TFLOPS metric: (2 × B × C_out × N_out × C_in × K × 1e-12) / (ms × 1e-3)
 """
@@ -47,18 +70,17 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_N_OUT": 32,  "BLOCK_C_OUT": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_N_OUT": 64,  "BLOCK_C_OUT": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_N_OUT": 128, "BLOCK_C_OUT": 16}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N_OUT": 32,  "BLOCK_C_OUT": 32}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_N_OUT": 64,  "BLOCK_C_OUT": 32}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N_OUT": 128, "BLOCK_C_OUT": 32}, num_stages=4, num_warps=8),
         triton.Config({"BLOCK_N_OUT": 16,  "BLOCK_C_OUT": 16}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_N_OUT": 32,  "BLOCK_C_OUT": 32}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_N_OUT": 64,  "BLOCK_C_OUT": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_N_OUT": 128, "BLOCK_C_OUT": 32}, num_stages=4, num_warps=8),
         triton.Config({"BLOCK_N_OUT": 32,  "BLOCK_C_OUT": 64}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N_OUT": 64,  "BLOCK_C_OUT": 64}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_N_OUT": 128, "BLOCK_C_OUT": 64}, num_stages=4, num_warps=8),
     ],
     key=["N_out", "C_in", "C_out"],
-    # K is a constexpr — Triton compiles a separate specialised kernel per K value,
-    # so it does not need to appear in the runtime key.
+    # K and K_PAD are constexpr — Triton specialises a separate compiled kernel per
+    # (K, K_PAD) pair; they do not need to appear in the runtime autotune key.
 )
 @triton.jit
 def conv1d_kernel(
@@ -67,7 +89,8 @@ def conv1d_kernel(
     stride_xb,  stride_xci, stride_xn,
     stride_wco, stride_wci, stride_wk,
     stride_yb,  stride_yco, stride_yn,
-    K:          tl.constexpr,   # kernel size — constexpr enables k-loop unrolling
+    K:           tl.constexpr,   # true kernel size
+    K_PAD:       tl.constexpr,   # max(16, next_power_of_2(K)) — tl.dot inner-dim padding
     BLOCK_N_OUT: tl.constexpr,
     BLOCK_C_OUT: tl.constexpr,
 ):
@@ -75,7 +98,7 @@ def conv1d_kernel(
     pid_n  = tl.program_id(1)   # tile index along N_out
 
     # Decode batch and output-channel block.
-    # BLOCK_C_OUT is constexpr → tl.cdiv compiles to a multiply-shift (no division).
+    # BLOCK_C_OUT is constexpr → tl.cdiv compiles to a multiply-shift, not a division.
     num_cout_blocks = tl.cdiv(C_out, BLOCK_C_OUT)
     pid_b           = pid_bc // num_cout_blocks
     pid_cout_block  = pid_bc %  num_cout_blocks
@@ -88,26 +111,43 @@ def conv1d_kernel(
     offs_cout  = cout_start + tl.arange(0, BLOCK_C_OUT)
     mask_cout  = offs_cout < C_out
 
-    # 2D accumulator: acc[i, j] = y[b, cout_start+i, n_start+j]
+    # k_pad_offs covers [0, K_PAD); only [0, K) are real kernel positions.
+    k_pad_offs = tl.arange(0, K_PAD)
+    k_mask     = k_pad_offs < K   # False for zero-padding positions
+
     acc = tl.zeros((BLOCK_C_OUT, BLOCK_N_OUT), dtype=tl.float32)
 
     for c_in in range(C_in):
-        # tl.static_range unrolls the K iterations at compile time.
-        # All K x-loads are independent (different offsets, no data dependency) — the
-        # compiler can issue them simultaneously, hiding global-memory round-trip latency.
-        for k in tl.static_range(K):
-            x_val = tl.load(
-                x_ptr + pid_b * stride_xb + c_in * stride_xci + (offs_n + k) * stride_xn,
-                mask=mask_n,
-                other=0.0,
-            )
-            w_val = tl.load(
-                w_ptr + offs_cout * stride_wco + c_in * stride_wci + k * stride_wk,
-                mask=mask_cout,
-                other=0.0,
-            )
-            # Outer product: (BLOCK_C_OUT, 1) × (1, BLOCK_N_OUT) → (BLOCK_C_OUT, BLOCK_N_OUT)
-            acc = acc + w_val[:, None].to(tl.float32) * x_val[None, :].to(tl.float32)
+        # ── W_tile : (BLOCK_C_OUT, K_PAD) ─────────────────────────────────────
+        # weight[offs_cout, c_in, k] zero-padded to K_PAD columns.
+        # offs_cout is contiguous in memory (stride_wco is the leading stride),
+        # so each row of W_tile is a coalesced load across output channels.
+        w_tile = tl.load(
+            w_ptr + offs_cout[:, None] * stride_wco
+                  + c_in * stride_wci
+                  + k_pad_offs[None, :] * stride_wk,
+            mask=mask_cout[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+
+        # ── X_tile : (K_PAD, BLOCK_N_OUT) ─────────────────────────────────────
+        # x[b, c_in, offs_n + k] for k=0..K-1 (rows) and offs_n (columns).
+        # Row k is the slice x[b, c_in, n_start+k : n_start+k+BLOCK_N_OUT] —
+        # BLOCK_N_OUT contiguous elements in the N dimension. ✓ coalesced.
+        # k_mask[:, None] zeros out rows K..K_PAD-1 (padding); those rows also
+        # have the corresponding W_tile columns zeroed, so they contribute 0 to acc.
+        x_tile = tl.load(
+            x_ptr + pid_b * stride_xb
+                  + c_in * stride_xci
+                  + (k_pad_offs[:, None] + offs_n[None, :]) * stride_xn,
+            mask=k_mask[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # ── GEMM step ──────────────────────────────────────────────────────────
+        # (BLOCK_C_OUT, K_PAD) × (K_PAD, BLOCK_N_OUT) → (BLOCK_C_OUT, BLOCK_N_OUT)
+        # tl.dot uses hardware-optimal register blocking; acc is updated in-place.
+        acc = tl.dot(w_tile, x_tile, acc=acc, out_dtype=tl.float32)
 
     y_offs = offs_cout[:, None] * stride_yco + offs_n[None, :] * stride_yn
     tl.store(
@@ -143,6 +183,10 @@ def conv1d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     N_out = N - K + 1
     y     = torch.empty((B, C_out, N_out), device=x.device, dtype=x.dtype)
 
+    # K_PAD: smallest value ≥ max(16, K) that is a power of 2.
+    # tl.dot requires the inner (K_PAD) dimension to be ≥ 16 and a power of 2.
+    K_PAD = max(16, triton.next_power_of_2(K))
+
     grid = lambda meta: (
         B * triton.cdiv(C_out, meta["BLOCK_C_OUT"]),
         triton.cdiv(N_out, meta["BLOCK_N_OUT"]),
@@ -153,7 +197,8 @@ def conv1d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         x.stride(0), x.stride(1), x.stride(2),
         w.stride(0), w.stride(1), w.stride(2),
         y.stride(0), y.stride(1), y.stride(2),
-        K=K,  # passed as constexpr — Triton JIT-compiles a separate kernel per K value
+        K=K,
+        K_PAD=K_PAD,
     )
     return y
 
@@ -186,10 +231,10 @@ def test_conv1d():
 # Fix B=1, C_in=C_out=128, K=7 (representative of audio/WaveNet-style convolutions).
 # Vary N (signal length) from 1K to 128K.
 #
-# Arithmetic intensity ≈ 0.5 FLOPs/byte (fp32) — well below T4's ridge point of ~25.
-# Both kernels are HBM-bandwidth-limited; TFLOPS reflects memory throughput.
-# At N≥4096 PyTorch (cuDNN) switches to implicit GEMM which reads x exactly once —
-# expect PyTorch to stay ahead at large N; the gap should be ≤2-3× post-fix.
+# At these parameters arithmetic intensity ≈ 0.5 FLOPs/byte (fp32) — HBM-limited.
+# PyTorch (cuDNN) switches from direct conv to implicit GEMM at N≈4096, reading x
+# exactly once from HBM. Our kernel reads x cdiv(C_out, BLOCK_C_OUT) times — a
+# structural gap that direct convolution cannot close without a full implicit GEMM.
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
