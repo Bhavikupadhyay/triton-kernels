@@ -12,44 +12,45 @@ Layout:
   weight : (C_out, C_in, K, K)       — square kernel
   y      : (B, C_out, H_out, W_out)  — H_out = H - K + 1, W_out = W - K + 1
 
-Algorithm — Implicit GEMM (conv1d extended to 2D):
+Algorithm — 2D-tiled Implicit GEMM:
 
-  Flatten output spatial: N_sp = H_out × W_out
-  Y[b, :, :] = W_flat(C_out, CK) @ X_col[b](CK, N_sp)
-  where CK = C_in × K², and
-    X_col[c_in*K² + kh*K + kw, h*W_out + w] = x[b, c_in, h + kh, w + kw]
+  Key insight: flattening H_out × W_out into a single spatial dim (as in conv1d) causes
+  GPU warp coalescing failures whenever W_out is not a multiple of BLOCK_N — consecutive
+  flat indices cross row boundaries and produce scattered (non-contiguous) x addresses.
 
-  Grid:
-    axis 0: cdiv(C_out, BLOCK_M)   — tiles over output channels
-    axis 1: cdiv(N_sp,  BLOCK_N)   — tiles over flattened output spatial
-    axis 2: B                       — one slice per batch element
+  Fix: tile in 2D. One output row per program (pid_h), BLOCK_W output columns per program
+  (pid_w). For a fixed (c_in, kh, kw) the x load becomes:
+    x[b, c_in, pid_h + kh, w_offs : w_offs + BLOCK_W]   — always contiguous along W ✓
 
-  Spatial decode — once per program, amortised over all inner iterations:
-    h_out[i] = flat[i] // W_out
-    w_out[i] = flat[i] % W_out
-  W_out is a runtime value → these are runtime integer divides, but they are
-  BLOCK_N scalar ops executed once before the inner loops begin.
+  Grid (3D):
+    axis 0: cdiv(C_out, BLOCK_M)            — C_out tiles
+    axis 1: H_out                            — one program per output row (pid_h = row index)
+    axis 2: B × cdiv(W_out, BLOCK_W)        — batch × W column tiles
 
-  Two-level inner loop (avoids derived-constexpr tl.arange — see conv1d):
+  Per-program accumulator: (BLOCK_M, BLOCK_W) — both explicit constexpr parameters;
+  no derived-constexpr arithmetic needed.
+
+  Inner loops (same two-level structure as conv1d):
     Outer : for c_tile in range(cdiv(C_in, C_PER_TILE))
     Inner : for kh in tl.static_range(K)   — K is constexpr → fully unrolled
             for kw in tl.static_range(K)
 
     Each (c_tile, kh, kw) step:
     ┌──────────────────────────────────────────────────────────────────────┐
-    │ W_sub : (BLOCK_M, C_PER_TILE) ← weight[M_tile, c_tile, kh, kw]     │
-    │ X_sub : (C_PER_TILE, BLOCK_N) ← x[b, c_tile, h_tile+kh, w_tile+kw] │
-    │ acc   += tl.dot(W_sub, X_sub)                                       │
+    │ W_sub : (BLOCK_M, C_PER_TILE) ← weight[m_offs, c_tile, kh, kw]     │
+    │ X_sub : (C_PER_TILE, BLOCK_W) ← x[b, c_tile, pid_h+kh, w_offs+kw] │
+    │   X load is BLOCK_W contiguous floats in memory (stride_xw=1) ✓    │
+    │ acc  += tl.dot(W_sub, X_sub)                                        │
     └──────────────────────────────────────────────────────────────────────┘
 
-  Total tl.dot calls per program: cdiv(C_in, C_PER_TILE) × K²
-    e.g. C_in=64, C_PER_TILE=16, K=3 → 4 × 9 = 36 dot calls
-    e.g. C_in=64, C_PER_TILE=32, K=3 → 2 × 9 = 18 dot calls
-
-  Bounds on x access: h_out < H_out = H−K+1 and kh < K → h_out+kh ≤ H−1 < H.
-  Same for w. No OOB once flat_offs is masked to N_sp — no extra bounds check needed.
+  Bound proofs (no extra mask needed on x):
+    pid_h   < H_out = H−K+1, kh < K  →  pid_h + kh  ≤ H−1 < H  ✓
+    w_offs  < W_out = W−K+1, kw < K  →  w_offs + kw ≤ W−1 < W  ✓
+    (masking only needed for edge tiles: mask_m, mask_w, mask_c)
 
   C_PER_TILE ≥ 16 (tl.dot inner-dim constraint on T4). Configs use {16, 32}.
+  BLOCK_W ≥ 16 for the same reason (inner dim of tl.dot is C_PER_TILE, not BLOCK_W —
+  but BLOCK_W ≥ 32 ensures the output tile is large enough to amortise loop overhead).
 
 TFLOPS metric: (2 × B × C_out × H_out × W_out × C_in × K² × 1e-12) / (ms × 1e-3)
 """
@@ -60,21 +61,21 @@ import triton
 import triton.language as tl
 
 
-# ── 1. Triton kernel — implicit GEMM ─────────────────────────────────────────
+# ── 1. Triton kernel — 2D-tiled implicit GEMM ────────────────────────────────
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 16}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 32}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "C_PER_TILE": 32}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 64,  "C_PER_TILE": 16}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_W": 64,  "C_PER_TILE": 16}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_W": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 64,  "C_PER_TILE": 32}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_W": 64,  "C_PER_TILE": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_W": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_W": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_W": 256, "C_PER_TILE": 32}, num_stages=4, num_warps=8),
     ],
     key=["C_in", "C_out", "H_out", "W_out"],
 )
@@ -85,30 +86,32 @@ def conv2d_kernel(
     stride_xb,  stride_xci, stride_xh,  stride_xw,
     stride_wco, stride_wci, stride_wkh, stride_wkw,
     stride_yb,  stride_yco, stride_yh,  stride_yw,
-    K:           tl.constexpr,   # kernel size (square: KH = KW = K)
+    K:           tl.constexpr,   # kernel size (square KH = KW = K)
     BLOCK_M:     tl.constexpr,   # tile over C_out
-    BLOCK_N:     tl.constexpr,   # tile over N_sp = H_out * W_out
+    BLOCK_W:     tl.constexpr,   # tile over W_out (output columns per program)
     C_PER_TILE:  tl.constexpr,   # C_in channels per inner tile; must be ≥ 16
 ):
-    pid_m = tl.program_id(0)   # C_out tile
-    pid_n = tl.program_id(1)   # spatial tile (flat H_out × W_out)
-    pid_b = tl.program_id(2)   # batch
+    pid_m  = tl.program_id(0)   # C_out tile
+    pid_h  = tl.program_id(1)   # output row index ∈ [0, H_out) — one row per program
+    pid_bw = tl.program_id(2)   # batch × W tile (flat)
 
-    # ── Output channel offsets ────────────────────────────────────────────────
+    # Decode batch and W-tile from axis 2.
+    n_w_tiles = tl.cdiv(W_out, BLOCK_W)   # runtime; BLOCK_W is constexpr
+    pid_b  = pid_bw // n_w_tiles
+    pid_w  = pid_bw %  n_w_tiles
+
+    # ── C_out offsets ─────────────────────────────────────────────────────────
     m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # BLOCK_M constexpr ✓
     mask_m = m_offs < C_out
 
-    # ── Flat spatial offsets → (h_out, w_out) ────────────────────────────────
-    # Decoded once per program, reused across all (c_tile, kh, kw) iterations.
-    flat_offs  = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # BLOCK_N constexpr ✓
-    mask_n     = flat_offs < H_out * W_out
-    h_out_offs = flat_offs // W_out   # (BLOCK_N,)
-    w_out_offs = flat_offs % W_out    # (BLOCK_N,)
+    # ── W output offsets ──────────────────────────────────────────────────────
+    w_offs = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)   # BLOCK_W constexpr ✓
+    mask_w = w_offs < W_out
 
-    # Per-tile C_in local offsets [0, 1, ..., C_PER_TILE-1]
-    c_tile_offs = tl.arange(0, C_PER_TILE)   # C_PER_TILE constexpr ✓
+    # ── C_in tile offsets ─────────────────────────────────────────────────────
+    c_tile_offs = tl.arange(0, C_PER_TILE)              # C_PER_TILE constexpr ✓
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_W), dtype=tl.float32)
 
     num_c_tiles = tl.cdiv(C_in, C_PER_TILE)
 
@@ -133,41 +136,45 @@ def conv2d_kernel(
                     other=0.0,
                 )
 
-                # ── X_sub : (C_PER_TILE, BLOCK_N) ───────────────────────────
-                # x[b, c_in_offs[c], h_out_offs[n] + kh, w_out_offs[n] + kw]
-                # h_out + kh ≤ H−1 and w_out + kw ≤ W−1 (proven in docstring).
+                # ── X_sub : (C_PER_TILE, BLOCK_W) ───────────────────────────
+                # x[b, c_in_offs[c], pid_h + kh, w_offs[n] + kw]
+                #
+                # Coalescing: w_offs = pid_w*BLOCK_W + [0, 1, ..., BLOCK_W-1]
+                # → w_offs + kw is a contiguous run of BLOCK_W integers.
+                # With stride_xw=1 (NCHW contiguous), this is a single cache-line
+                # aligned load — no row-boundary scatter regardless of W_out. ✓
                 x_sub = tl.load(
                     x_ptr
-                    + pid_b                        * stride_xb
-                    + c_in_offs[:, None]           * stride_xci
-                    + (h_out_offs[None, :] + kh)   * stride_xh
-                    + (w_out_offs[None, :] + kw)   * stride_xw,
-                    mask=mask_c[:, None] & mask_n[None, :],
+                    + pid_b              * stride_xb
+                    + c_in_offs[:, None] * stride_xci
+                    + (pid_h + kh)       * stride_xh
+                    + (w_offs[None, :] + kw) * stride_xw,
+                    mask=mask_c[:, None] & mask_w[None, :],
                     other=0.0,
                 )
 
                 # ── GEMM step ────────────────────────────────────────────────
-                # (BLOCK_M, C_PER_TILE) × (C_PER_TILE, BLOCK_N) → (BLOCK_M, BLOCK_N)
+                # (BLOCK_M, C_PER_TILE) × (C_PER_TILE, BLOCK_W) → (BLOCK_M, BLOCK_W)
                 acc += tl.dot(w_sub, x_sub, out_dtype=tl.float32)
 
     # ── Store output ──────────────────────────────────────────────────────────
-    # Re-use the decoded (h_out_offs, w_out_offs) to scatter into y[b, m, h, w].
+    # y[b, m_offs, pid_h, w_offs] — w_offs consecutive → contiguous store ✓
     y_offs = (
-        m_offs[:, None]      * stride_yco
-        + h_out_offs[None, :] * stride_yh
-        + w_out_offs[None, :] * stride_yw
+        m_offs[:, None]   * stride_yco
+        + pid_h           * stride_yh
+        + w_offs[None, :] * stride_yw
     )
     tl.store(
         y_ptr + pid_b * stride_yb + y_offs,
         acc.to(y_ptr.dtype.element_ty),
-        mask=mask_m[:, None] & mask_n[None, :],
+        mask=mask_m[:, None] & mask_w[None, :],
     )
 
 
 # ── 2. Python wrapper ─────────────────────────────────────────────────────────
 
 def conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Implicit-GEMM 2D convolution — square kernel, no padding, no bias.
+    """2D-tiled implicit-GEMM convolution — square kernel, no padding, no bias.
 
     Args:
         x: (B, C_in, H, W)       input tensor on CUDA, NCHW layout.
@@ -193,11 +200,10 @@ def conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     W_out = W - K + 1
     y     = torch.empty((B, C_out, H_out, W_out), device=x.device, dtype=x.dtype)
 
-    N_sp = H_out * W_out
     grid = lambda meta: (
         triton.cdiv(C_out, meta["BLOCK_M"]),
-        triton.cdiv(N_sp,  meta["BLOCK_N"]),
-        B,
+        H_out,                                          # one row per pid_h
+        B * triton.cdiv(W_out, meta["BLOCK_W"]),
     )
     conv2d_kernel[grid](
         x, w, y,
@@ -238,9 +244,6 @@ def test_conv2d():
 #
 # Fix B=1, C_in=C_out=64, K=3 (ResNet-style 3×3 conv).
 # Vary H=W (square images) from 32 to 512.
-#
-# N_sp = (H-2)² grows quadratically. At H=512, N_sp ≈ 260K spatial positions.
-# Both kernels are compute-bound (AI ≫ ridge point) at these channel counts.
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -249,7 +252,7 @@ def test_conv2d():
         x_log=True,
         line_arg="provider",
         line_vals=["triton", "torch"],
-        line_names=["Triton (implicit GEMM)", "PyTorch (F.conv2d)"],
+        line_names=["Triton (2D-tiled implicit GEMM)", "PyTorch (F.conv2d)"],
         styles=[("blue", "-"), ("green", "--")],
         ylabel="TFLOPS",
         plot_name="conv2d",
