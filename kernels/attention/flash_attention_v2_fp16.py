@@ -19,13 +19,20 @@ import torch.nn.functional as F
 
 @triton.autotune(
     configs=[
-        # Larger blocks: better compute intensity once data fits in SMEM.
-        # fp16 halves memory vs fp32, so BLOCK_M=128 is now practical.
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32}, num_warps=4, num_stages=2),
+        # T4 (SM75) has 48 KB shared memory per SM. With num_stages=S, Triton
+        # buffers S K tiles + S V tiles in SMEM for pipelining.
+        # SMEM per stage = 2 * BLOCK_N * BLOCK_D * 2 bytes (fp16).
+        # Configs sized so S*(2*BLOCK_N*BLOCK_D*2) <= 32 KB, leaving ≥16 KB
+        # headroom for the compiler and a second block for latency hiding.
+        #
+        # BLOCK_M=128 removed: its register pressure (~64 KB acc in fp32) leaves
+        # no room for a second block per SM, killing occupancy and negating any
+        # tensor-core gain.
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=4),
     ],
     key=["N", "d"],
 )
@@ -55,7 +62,9 @@ def flash_attention_v2_fp16_kernel(
     - Output cast back to fp16 before the final store.
 
     Structural changes vs fp32 v2:
-    - BLOCK_M=128 is viable (fp16 halves SMEM vs fp32 v2's max BLOCK_M=64).
+    - BLOCK_M capped at 64 (same as fp32): BLOCK_M=128 would fill T4's 48 KB
+      SMEM budget entirely, leaving no room for a second resident block and
+      killing occupancy. Tensor-core gain does not compensate.
     - num_stages=2/4 enables Triton's software pipelining: memory loads for
       the next K/V tile are issued while the current tile's matmul executes.
     """
