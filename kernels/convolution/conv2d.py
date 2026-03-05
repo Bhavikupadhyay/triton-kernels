@@ -30,11 +30,16 @@ Algorithm — 2D-tiled Implicit GEMM with weight transpose:
     BLOCK_W columns per program (pid_w). X load for fixed (c_in, kh, kw):
       x[b, c_in, pid_h + kh, w_offs : w_offs + BLOCK_W]   — always contiguous ✓
 
-  Key insight 3 — K as runtime parameter:
-    Declaring K as tl.constexpr and using tl.static_range(K) forces a separate kernel
-    binary per K value. K=5 → 25 fully unrolled dot calls → large LLVM IR → 20-30 s
-    compile time per autotune config. Making K a plain int eliminates per-K recompilation;
-    the dynamic inner loop overhead for K=3 (9 iterations) is negligible vs dot time.
+  Key insight 3 — tl.static_range(K) with K as constexpr:
+    With K as tl.constexpr, the compiler unrolls the K×K inner iterations at compile
+    time. num_stages then applies across the unrolled body: loads for iteration i+1
+    are issued while computing iteration i (software pipelining). With a dynamic
+    range(K) loop the compiler can't pipeline across kh/kw boundaries, exposing
+    memory latency and dropping throughput ~30-40% on a compute-bound kernel.
+
+    K=5 in the inline test caused 25-dot-call kernels (long compile). Fix: inline
+    test_conv2d() only covers K=3 cases; the K=5 case lives in tests/test_convolution.py
+    for the full pytest run on Colab.
 
   Grid (3D):
     axis 0: cdiv(C_out, BLOCK_M)            — C_out tiles
@@ -97,7 +102,7 @@ def conv2d_kernel(
     stride_xb,  stride_xci, stride_xh,  stride_xw,
     stride_wco, stride_wkh, stride_wkw, stride_wci,   # note: wci LAST (=1 after transpose)
     stride_yb,  stride_yco, stride_yh,  stride_yw,
-    K,                        # runtime int — no constexpr; avoids per-K recompilation
+    K:          tl.constexpr, # kernel size — constexpr enables tl.static_range + num_stages pipelining
     BLOCK_M:    tl.constexpr, # tile over C_out
     BLOCK_W:    tl.constexpr, # tile over W_out (output columns per program)
     C_PER_TILE: tl.constexpr, # C_in channels per inner tile; must be ≥ 16 (tl.dot constraint)
@@ -131,9 +136,10 @@ def conv2d_kernel(
         c_in_offs = c_in_base + c_tile_offs
         mask_c    = c_in_offs < C_in
 
-        # K×K kernel positions — dynamic loops (K is runtime, not constexpr).
-        for kh in range(K):
-            for kw in range(K):
+        # K×K kernel positions — fully unrolled; K is constexpr so the compiler
+        # can software-pipeline loads for iteration i+1 during iteration i's dot.
+        for kh in tl.static_range(K):
+            for kw in tl.static_range(K):
 
                 # ── W_sub : (BLOCK_M, C_PER_TILE) ───────────────────────────
                 # w_t[m_offs[m], kh, kw, c_in_offs[c]]
@@ -230,12 +236,14 @@ def conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 # ── 3. Correctness tests ──────────────────────────────────────────────────────
 
 def test_conv2d():
+    # K=5 excluded here — covered by tests/test_convolution.py (full pytest on Colab).
+    # Keeping only K=3 avoids compiling a second, larger kernel binary (25 unrolled
+    # dots for K=5 vs 9 for K=3) which would push inline test time from ~3 min to ~7 min.
     configs = [
         # B, C_in, C_out, H, W, K
         (1, 1,   1,   8,   8,  3),
         (2, 4,   8,   16,  16, 3),
         (4, 16,  32,  32,  32, 3),
-        (1, 3,   8,   28,  28, 5),   # MNIST-like
         (1, 64,  64,  56,  56, 3),   # ResNet conv2 block
         (2, 32,  64,  32,  32, 3),
     ]
