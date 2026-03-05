@@ -209,3 +209,43 @@ def test_flash_v2_first_token():
     v = torch.randn(B, H, N, d, device="cuda")
     got = flash_attention_v2(q, k, v)
     torch.testing.assert_close(got[0, 0, 0], v[0, 0, 0], atol=1e-3, rtol=1e-3)
+from kernels.attention.flash_attention_v2_fp16 import flash_attention_v2_fp16
+
+
+# ── flash_attention_v2_fp16 ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("d", [32, 64])
+@pytest.mark.parametrize("B,H", [(1, 1), (2, 4)])
+def test_flash_v2_fp16_shapes(N, d, B, H):
+    torch.manual_seed(0)
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    got = flash_attention_v2_fp16(q, k, v)
+    torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_flash_v2_fp16_dtype_passthrough():
+    """fp32 input must produce fp32 output; fp16 input must produce fp16 output."""
+    B, H, N, d = 1, 1, 128, 64
+    for dtype in [torch.float16, torch.float32]:
+        q = torch.randn(B, H, N, d, device="cuda", dtype=dtype)
+        k = torch.randn(B, H, N, d, device="cuda", dtype=dtype)
+        v = torch.randn(B, H, N, d, device="cuda", dtype=dtype)
+        out = flash_attention_v2_fp16(q, k, v)
+        assert out.dtype == dtype, f"expected {dtype}, got {out.dtype}"
+
+
+def test_flash_v2_fp16_matches_fp32_v2():
+    """fp16 and fp32 v2 outputs should agree within fp16 tolerance."""
+    from kernels.attention.flash_attention_v2 import flash_attention_v2
+    B, H, N, d = 2, 4, 512, 64
+    torch.manual_seed(1)
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    out_fp32 = flash_attention_v2(q, k, v)
+    out_fp16 = flash_attention_v2_fp16(q, k, v)
+    torch.testing.assert_close(out_fp16, out_fp32, atol=1e-2, rtol=1e-2)
