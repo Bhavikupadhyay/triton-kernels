@@ -12,7 +12,7 @@ Layout:
   weight : (C_out, C_in, K)   — output channels, input channels, kernel size
   y      : (B, C_out, N_out)  — N_out = N - K + 1  (valid convolution, no padding)
 
-Algorithm — Implicit GEMM (tiled matrix multiply without materialising im2col):
+Algorithm — Implicit GEMM (two-level tiled matrix multiply, no im2col materialisation):
 
   Observation: conv1d is equivalent to a matrix multiply
     Y[b, :, :] = W_flat @ X_col[b]        (C_out, N_out) = (C_out, CK) @ (CK, N_out)
@@ -26,28 +26,43 @@ Algorithm — Implicit GEMM (tiled matrix multiply without materialising im2col)
     axis 1: cdiv(N_out, BLOCK_N)   — tiles over output positions
     axis 2: B                       — one slice per batch element
 
-  Inner loop over BLOCK_K = C_PER_TILE × K sized tiles of the CK dimension:
+  Two-level inner loop over the CK dimension:
+    Outer: c_tile in range(cdiv(C_in, C_PER_TILE))   — C_in in chunks of C_PER_TILE
+    Inner: k in tl.static_range(K)                    — K positions, fully unrolled
+
+    Each (c_tile, k) step:
     ┌──────────────────────────────────────────────────────────────────────┐
-    │ W_tile : (BLOCK_M, BLOCK_K) ← weight[M_tile, c_in_base*K : c_in_end*K] │
-    │ X_tile : (BLOCK_K, BLOCK_N) ← x[b, c_in_base:c_in_end, N_tile + k_off] │
-    │ acc    += tl.dot(W_tile, X_tile)                                    │
+    │ W_sub : (BLOCK_M, C_PER_TILE) ← weight[M_tile, c_in_base:c_in_end, k] │
+    │ X_sub : (C_PER_TILE, BLOCK_N) ← x[b, c_in_base:c_in_end, N_tile + k]  │
+    │ acc   += tl.dot(W_sub, X_sub)                                       │
     └──────────────────────────────────────────────────────────────────────┘
 
-  BLOCK_K = C_PER_TILE × K is always a multiple of K. Within each tile:
-    c_in_off[k_inner] = k_inner // K   — compile-time constant (K is constexpr)
-    k_off[k_inner]    = k_inner % K    — compile-time constant
+  Why two levels instead of one BLOCK_K = C_PER_TILE × K loop:
+    Triton's JIT traces functions symbolically. A value like BLOCK_K = K * C_PER_TILE
+    computed inside the kernel body loses its constexpr status — even though both
+    operands are tl.constexpr — because the variable assignment is evaluated at trace
+    time in a context where _unwrap_if_constexpr may not produce a plain int.
+    tl.arange(0, BLOCK_K) then raises "arguments must be of type tl.constexpr".
+    Splitting into two loops uses only BLOCK_M, BLOCK_N, K, C_PER_TILE directly in
+    tl.arange — all of which are explicit tl.constexpr kernel parameters.
 
-  This means each row k of X_tile is a contiguous BLOCK_N-wide load:
-    x[b, c_in_base + c_in_off[k], N_tile_start + k_off[k] : N_tile_start + k_off[k] + BLOCK_N]
+  C_PER_TILE ≥ 16 constraint:
+    tl.dot requires the inner (contraction) dimension to be ≥ 16 for Triton's hardware
+    matmul path. C_PER_TILE is that inner dim, so autotune configs use {16, 32}.
+
+  Total tl.dot calls per program: cdiv(C_in, C_PER_TILE) × K
+    = (128/16) × 7 = 56  (C_PER_TILE=16)
+    = (128/32) × 7 = 28  (C_PER_TILE=32)
+  Each call: (BLOCK_M, C_PER_TILE) × (C_PER_TILE, BLOCK_N) → (BLOCK_M, BLOCK_N)
 
   Key properties vs previous outer-product approach:
   • X is read once per N_out tile regardless of C_out (no C_out fan-out amplification).
     Previous approach read x cdiv(C_out, BLOCK_C_OUT) times per N_tile.
-  • W fits in L2 cache (128 × 128 × 7 × 4 = 0.45 MB) and is reused across N_out tiles.
+  • W fits in L2 cache and is reused across N_out tiles.
   • tl.dot uses hardware-optimal register blocking: each thread holds a submatrix of
-    acc (BLOCK_M × BLOCK_N) across all C_PER_TILE loop iterations — FMA units stay busy.
-  • Software pipelining (num_stages) hides the memory latency of the next tile's loads
-    behind computation of the current tile's dot product.
+    acc (BLOCK_M × BLOCK_N) across all loop iterations — FMA units stay busy.
+  • tl.static_range(K) unrolls the K loop at compile time → no runtime branch overhead;
+    the compiler can schedule 7 consecutive load+dot blocks for software pipelining.
 
   Remaining gap vs cuDNN implicit GEMM:
   • cuDNN reuses W_flat across all B batch elements simultaneously; our kernel has one
@@ -65,20 +80,20 @@ import triton
 import triton.language as tl
 
 
-# ── 1. Triton kernel — implicit GEMM ─────────────────────────────────────────
+# ── 1. Triton kernel — implicit GEMM, two-level loop ─────────────────────────
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 4}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 4}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 4}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 8}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 8}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 8}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "C_PER_TILE": 4}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "C_PER_TILE": 4}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 16}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 16}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "C_PER_TILE": 32}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "C_PER_TILE": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "C_PER_TILE": 32}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "C_PER_TILE": 16}, num_stages=4, num_warps=8),
     ],
     key=["C_in", "C_out", "N_out"],
 )
@@ -92,63 +107,60 @@ def conv1d_kernel(
     K:           tl.constexpr,   # kernel size
     BLOCK_M:     tl.constexpr,   # tile over C_out
     BLOCK_N:     tl.constexpr,   # tile over N_out
-    C_PER_TILE:  tl.constexpr,   # C_in channels per K-inner tile; BLOCK_K = K × C_PER_TILE
+    C_PER_TILE:  tl.constexpr,   # C_in channels per inner tile; must be ≥ 16 (tl.dot constraint)
 ):
-    # BLOCK_K is a compile-time constant (both K and C_PER_TILE are constexpr)
-    BLOCK_K = K * C_PER_TILE
-
     pid_m = tl.program_id(0)  # C_out tile
     pid_n = tl.program_id(1)  # N_out tile
     pid_b = tl.program_id(2)  # batch
 
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # BLOCK_M is constexpr ✓
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # BLOCK_N is constexpr ✓
     mask_m = m_offs < C_out
     mask_n = n_offs < N_out
 
-    # Per-position offsets within a BLOCK_K tile.
-    # K is constexpr → // and % fold to compile-time constant arrays.
-    k_arange      = tl.arange(0, BLOCK_K)   # [0, 1, ..., BLOCK_K-1]
-    c_in_tile_rel = k_arange // K            # which c_in offset within the tile
-    k_tile_rel    = k_arange % K             # which k offset within that c_in
+    # Per-tile C_in local offsets [0, 1, ..., C_PER_TILE-1].
+    # Computed once outside the loops and reused — C_PER_TILE is constexpr ✓.
+    c_tile_offs = tl.arange(0, C_PER_TILE)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    num_k_tiles = tl.cdiv(C_in, C_PER_TILE)
+    num_c_tiles = tl.cdiv(C_in, C_PER_TILE)
 
-    for k_tile in range(num_k_tiles):
-        c_in_base = k_tile * C_PER_TILE
+    for c_tile in range(num_c_tiles):
+        c_in_base = c_tile * C_PER_TILE
+        c_in_offs = c_in_base + c_tile_offs   # absolute c_in indices for this tile
+        mask_c    = c_in_offs < C_in
 
-        # ── W_tile : (BLOCK_M, BLOCK_K) ─────────────────────────────────────
-        # weight[m, c_in_base + c_in_tile_rel[k], k_tile_rel[k]]
-        # For contiguous weight (stride_wco = C_in*K, stride_wci = K, stride_wk = 1)
-        # this is weight viewed as (C_out, C_in*K) with contiguous k_inner columns.
-        w_tile = tl.load(
-            w_ptr
-            + m_offs[:, None] * stride_wco
-            + (c_in_base + c_in_tile_rel[None, :]) * stride_wci
-            + k_tile_rel[None, :] * stride_wk,
-            mask=mask_m[:, None] & ((c_in_base + c_in_tile_rel[None, :]) < C_in),
-            other=0.0,
-        )
+        # Inner loop over K — fully unrolled because K is constexpr.
+        # tl.static_range(K) tells Triton to unroll at compile time.
+        for k in tl.static_range(K):
 
-        # ── X_tile : (BLOCK_K, BLOCK_N) ─────────────────────────────────────
-        # x[b, c_in_base + c_in_tile_rel[k], n_offs[j] + k_tile_rel[k]]
-        # Row k is x[b, c_in_abs, n_start + k_off : n_start + k_off + BLOCK_N] — contiguous.
-        # Mask: c_in_abs < C_in is sufficient; n_offs + k_tile_rel < N is guaranteed
-        # because n_offs < N_out = N - K + 1 and k_tile_rel ≤ K-1, so n_offs + k_tile_rel ≤ N-1.
-        x_tile = tl.load(
-            x_ptr
-            + pid_b * stride_xb
-            + (c_in_base + c_in_tile_rel[:, None]) * stride_xci
-            + (k_tile_rel[:, None] + n_offs[None, :]) * stride_xn,
-            mask=((c_in_base + c_in_tile_rel[:, None]) < C_in) & mask_n[None, :],
-            other=0.0,
-        )
+            # ── W_sub : (BLOCK_M, C_PER_TILE) ───────────────────────────────
+            # weight[m_offs[m], c_in_offs[c], k]
+            w_sub = tl.load(
+                w_ptr
+                + m_offs[:, None]    * stride_wco
+                + c_in_offs[None, :] * stride_wci
+                + k                  * stride_wk,
+                mask=mask_m[:, None] & mask_c[None, :],
+                other=0.0,
+            )
 
-        # ── GEMM step ────────────────────────────────────────────────────────
-        # (BLOCK_M, BLOCK_K) × (BLOCK_K, BLOCK_N) → (BLOCK_M, BLOCK_N)
-        acc += tl.dot(w_tile, x_tile, out_dtype=tl.float32)
+            # ── X_sub : (C_PER_TILE, BLOCK_N) ───────────────────────────────
+            # x[b, c_in_offs[c], n_offs[n] + k]
+            # n_offs + k < N is guaranteed: n_offs < N_out = N-K+1, k ≤ K-1 → n_offs+k ≤ N-1.
+            x_sub = tl.load(
+                x_ptr
+                + pid_b              * stride_xb
+                + c_in_offs[:, None] * stride_xci
+                + (n_offs[None, :] + k) * stride_xn,
+                mask=mask_c[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+
+            # ── GEMM step ────────────────────────────────────────────────────
+            # (BLOCK_M, C_PER_TILE) × (C_PER_TILE, BLOCK_N) → (BLOCK_M, BLOCK_N)
+            acc += tl.dot(w_sub, x_sub, out_dtype=tl.float32)
 
     y_offs = m_offs[:, None] * stride_yco + n_offs[None, :] * stride_yn
     tl.store(
