@@ -1,0 +1,199 @@
+"""
+Kernel:   conv1d
+Category: convolution
+Complexity: O(B × C_out × N_out × C_in × K)
+Memory bound: Yes — arithmetic intensity ≈ 2·K·C_in / (K·C_in·dtype_bytes + dtype_bytes)
+              is sub-1 FLOPs/byte for typical (K, C_in); HBM bandwidth is the bottleneck.
+PyTorch equivalent: torch.nn.functional.conv1d(x, weight, padding=0)
+References:
+  - Direct convolution: https://en.wikipedia.org/wiki/Convolution#Discrete_convolution
+
+Layout:
+  x      : (B, C_in, N)       — batch, input channels, signal length
+  weight : (C_out, C_in, K)   — output channels, input channels, kernel size
+  y      : (B, C_out, N_out)  — N_out = N - K + 1  (valid convolution, no padding)
+
+Parallelism:
+  One program per (batch_idx, out_channel_idx, output_tile).
+  Grid: (B × C_out, cdiv(N_out, BLOCK_N_OUT))
+    axis 0: flat index encoding (b, c_out), decoded inside the kernel
+    axis 1: tile index along the output length dimension
+
+Inner loop (per program):
+  For c_in in [0, C_in) and k in [0, K):
+    acc[offs] += x[b, c_in, offs_n + k] * w[c_out, c_in, k]
+
+  This is direct convolution — no im2col, no Winograd transform.
+  For each output position n_out in the tile the required input window is
+  [n_out, n_out + K). Because n_out < N_out = N - K + 1 by construction,
+  n_out + K - 1 ≤ N - 1, so all K positions are in-bounds. The tile-edge
+  mask (offs_n < N_out) is sufficient; no additional K-direction masking needed.
+
+TFLOPS metric: (2 × B × C_out × N_out × C_in × K × 1e-12) / (ms × 1e-3)
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# ── 1. Triton kernel ──────────────────────────────────────────────────────────
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N_OUT": 32},  num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_N_OUT": 64},  num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_N_OUT": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_N_OUT": 256}, num_stages=2, num_warps=8),
+    ],
+    key=["N_out", "C_in", "K"],
+)
+@triton.jit
+def conv1d_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, C_in, C_out, N, N_out, K,
+    stride_xb,  stride_xci, stride_xn,
+    stride_wco, stride_wci, stride_wk,
+    stride_yb,  stride_yco, stride_yn,
+    BLOCK_N_OUT: tl.constexpr,
+):
+    pid_bc = tl.program_id(0)   # flat (b, c_out) index
+    pid_n  = tl.program_id(1)   # tile index along N_out
+
+    pid_b    = pid_bc // C_out
+    pid_cout = pid_bc %  C_out
+
+    n_start = pid_n * BLOCK_N_OUT
+    offs_n  = n_start + tl.arange(0, BLOCK_N_OUT)
+    mask_n  = offs_n < N_out
+
+    acc = tl.zeros((BLOCK_N_OUT,), dtype=tl.float32)
+
+    for c_in in range(C_in):
+        for k in range(K):
+            # Load x[b, c_in, offs_n + k]; mask_n sufficient — see bounds proof in docstring
+            x_val = tl.load(
+                x_ptr + pid_b * stride_xb + c_in * stride_xci + (offs_n + k) * stride_xn,
+                mask=mask_n,
+                other=0.0,
+            )
+            # Scalar weight w[c_out, c_in, k]; broadcast over BLOCK_N_OUT positions
+            w_val = tl.load(w_ptr + pid_cout * stride_wco + c_in * stride_wci + k * stride_wk)
+            acc   = acc + x_val.to(tl.float32) * w_val.to(tl.float32)
+
+    tl.store(
+        y_ptr + pid_b * stride_yb + pid_cout * stride_yco + offs_n * stride_yn,
+        acc.to(y_ptr.dtype.element_ty),
+        mask=mask_n,
+    )
+
+
+# ── 2. Python wrapper ─────────────────────────────────────────────────────────
+
+def conv1d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Direct 1D convolution — no padding, no bias.
+
+    Args:
+        x: (B, C_in, N)      input tensor on CUDA.
+        w: (C_out, C_in, K)  weight tensor on CUDA.
+
+    Returns:
+        y: (B, C_out, N - K + 1), same dtype as x.
+    """
+    assert x.is_cuda and w.is_cuda, "Inputs must be on CUDA"
+    x = x.contiguous()
+    w = w.contiguous()
+    assert x.ndim == 3, "x must be 3D: (B, C_in, N)"
+    assert w.ndim == 3, "w must be 3D: (C_out, C_in, K)"
+
+    B, C_in, N     = x.shape
+    C_out, C_in_w, K = w.shape
+    assert C_in == C_in_w, f"Channel mismatch: x has C_in={C_in}, w has C_in={C_in_w}"
+    assert N >= K,         f"Signal length N={N} must be >= kernel size K={K}"
+
+    N_out = N - K + 1
+    y     = torch.empty((B, C_out, N_out), device=x.device, dtype=x.dtype)
+
+    grid = lambda meta: (B * C_out, triton.cdiv(N_out, meta["BLOCK_N_OUT"]))
+    conv1d_kernel[grid](
+        x, w, y,
+        B, C_in, C_out, N, N_out, K,
+        x.stride(0), x.stride(1), x.stride(2),
+        w.stride(0), w.stride(1), w.stride(2),
+        y.stride(0), y.stride(1), y.stride(2),
+    )
+    return y
+
+
+# ── 3. Correctness tests ──────────────────────────────────────────────────────
+
+def test_conv1d():
+    configs = [
+        (1,  1,   1,   16,   3),   # minimal — single channel
+        (2,  4,   8,   64,   5),   # small multi-channel
+        (4,  16,  32,  512,  7),   # larger channels
+        (3,  5,   7,   100,  3),   # non-powers-of-2
+        (1,  64,  64,  1024, 11),  # wider kernel
+        (8,  32,  64,  2048, 3),   # larger batch
+    ]
+    for dtype in [torch.float32, torch.float16]:
+        for B, C_in, C_out, N, K in configs:
+            x   = torch.randn(B, C_in, N,     device="cuda", dtype=dtype)
+            w   = torch.randn(C_out, C_in, K, device="cuda", dtype=dtype)
+            ref = F.conv1d(x, w)
+            got = conv1d(x, w)
+            tol = dict(rtol=1e-2, atol=1e-2) if dtype == torch.float16 else dict(rtol=1e-3, atol=1e-3)
+            torch.testing.assert_close(got, ref, **tol)
+
+    print("test_conv1d: PASSED")
+
+
+# ── 4. Benchmarks ─────────────────────────────────────────────────────────────
+#
+# Fix B=1, C_in=C_out=128, K=7 (representative of audio/WaveNet-style convolutions).
+# Vary N (signal length) from 1K to 128K.
+#
+# At these parameters arithmetic intensity ≈ 0.5 FLOPs/byte (fp32), well below the
+# T4's ridge point of ~25 FLOPs/byte — HBM bandwidth limits both kernels.
+# TFLOPS numbers therefore reflect how efficiently each kernel moves data, not
+# how fast it performs arithmetic.
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["N"],
+        x_vals=[2**i for i in range(10, 18)],   # 1024 → 131072
+        x_log=True,
+        line_arg="provider",
+        line_vals=["triton", "torch"],
+        line_names=["Triton", "PyTorch (F.conv1d)"],
+        styles=[("blue", "-"), ("green", "--")],
+        ylabel="TFLOPS",
+        plot_name="conv1d",
+        args={"B": 1, "C_in": 128, "C_out": 128, "K": 7},
+    )
+)
+def benchmark_conv1d(B, C_in, C_out, K, N, provider):
+    x         = torch.randn(B, C_in, N,     device="cuda", dtype=torch.float32)
+    w         = torch.randn(C_out, C_in, K, device="cuda", dtype=torch.float32)
+    N_out     = N - K + 1
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "triton":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: conv1d(x, w), warmup=25, rep=100, quantiles=quantiles
+        )
+    else:
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: F.conv1d(x, w), warmup=25, rep=100, quantiles=quantiles
+        )
+
+    tflops = 2 * B * C_out * N_out * C_in * K * 1e-12
+    return tflops / (ms * 1e-3), tflops / (max_ms * 1e-3), tflops / (min_ms * 1e-3)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    test_conv1d()
+    benchmark_conv1d.run(print_data=True, show_plots=True)
