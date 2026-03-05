@@ -169,3 +169,43 @@ def test_flash_v1_first_token():
     v = torch.randn(B, H, N, d, device="cuda")
     got = flash_attention_v1(q, k, v)
     torch.testing.assert_close(got[0, 0, 0], v[0, 0, 0], atol=1e-3, rtol=1e-3)
+from kernels.attention.flash_attention_v2 import flash_attention_v2
+
+
+# ── flash_attention_v2 ────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("d", [32, 64])
+@pytest.mark.parametrize("B,H", [(1, 1), (2, 4)])
+def test_flash_v2_shapes(N, d, B, H):
+    torch.manual_seed(0)
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    got = flash_attention_v2(q, k, v)
+    torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_flash_v2_matches_v1():
+    """v2 output must match v1 output exactly (same algorithm, better tiling)."""
+    from kernels.attention.flash_attention_v1 import flash_attention_v1
+    B, H, N, d = 2, 4, 512, 64
+    torch.manual_seed(1)
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
+    got_v1 = flash_attention_v1(q, k, v)
+    got_v2 = flash_attention_v2(q, k, v)
+    torch.testing.assert_close(got_v2, got_v1, atol=1e-3, rtol=1e-3)
+
+
+def test_flash_v2_first_token():
+    """Position 0 attends only to itself; output[0] must equal V[0]."""
+    B, H, N, d = 1, 1, 256, 64
+    torch.manual_seed(2)
+    q = torch.randn(B, H, N, d, device="cuda")
+    k = torch.randn(B, H, N, d, device="cuda")
+    v = torch.randn(B, H, N, d, device="cuda")
+    got = flash_attention_v2(q, k, v)
+    torch.testing.assert_close(got[0, 0, 0], v[0, 0, 0], atol=1e-3, rtol=1e-3)
