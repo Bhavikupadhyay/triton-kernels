@@ -249,3 +249,14 @@ def test_flash_v2_fp16_matches_fp32_v2():
     out_fp32 = flash_attention_v2(q, k, v)
     out_fp16 = flash_attention_v2_fp16(q, k, v)
     torch.testing.assert_close(out_fp16, out_fp32, atol=1e-2, rtol=1e-2)
+
+
+def test_flash_v2_fp16_large_n():
+    """Flash attention fp16 should handle N=8192 without OOM."""
+    B, H, N, d = 1, 4, 8192, 64
+    q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, N, d, device="cuda", dtype=torch.float16)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    got = flash_attention_v2_fp16(q, k, v)
+    torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2)

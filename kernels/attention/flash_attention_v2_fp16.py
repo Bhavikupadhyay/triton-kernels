@@ -249,11 +249,11 @@ def test_flash_attention_v2_fp16():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N"],
-        x_vals=[128, 256, 512, 1024, 2048, 4096],
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
         x_log=True,
         line_arg="provider",
         line_vals=["triton_fp16", "triton_fp32_v2", "torch"],
-        line_names=["Triton Flash v2 (fp16)", "Triton Flash v2 (fp32)", "torch SDPA (causal)"],
+        line_names=["Triton Flash v2 (fp16)", "Triton Flash v2 (fp32)", "torch SDPA (causal, fp16)"],
         styles=[("blue", "-"), ("red", "--"), ("green", ":")],
         ylabel="TFLOPS",
         plot_name="flash_attention_v2_fp16_benchmark",
@@ -282,10 +282,13 @@ def benchmark_flash_attention_v2_fp16(N, B, H, d, provider):
             warmup=25, rep=100, quantiles=quantiles,
         )
     else:
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: F.scaled_dot_product_attention(q16, k16, v16, is_causal=True),
-            warmup=25, rep=100, quantiles=quantiles,
-        )
+        try:
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: F.scaled_dot_product_attention(q16, k16, v16, is_causal=True),
+                warmup=25, rep=100, quantiles=quantiles,
+            )
+        except torch.cuda.OutOfMemoryError:
+            return float("nan"), float("nan"), float("nan")
 
     tflops = lambda ms: (2 * B * H * N * N * d * 1e-12) / (ms * 1e-3)
     return tflops(ms), tflops(max_ms), tflops(min_ms)
