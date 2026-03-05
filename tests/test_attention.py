@@ -4,6 +4,7 @@ import torch
 import pytest
 from kernels.attention.naive_attention import naive_attention
 from kernels.attention.sdpa import sdpa
+from kernels.attention.multi_head_attention import multi_head_attention, _ref_mha
 
 
 @pytest.mark.parametrize("N", [64, 128, 256, 512])
@@ -82,3 +83,48 @@ def test_sdpa_last_token_matches_full():
     torch.testing.assert_close(
         causal_out[0, 0, -1], full_out[0, 0, -1], atol=1e-3, rtol=1e-3
     )
+
+
+# ── multi_head_attention ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("N", [64, 128, 256, 512])
+@pytest.mark.parametrize("H,d", [(4, 32), (8, 64)])
+@pytest.mark.parametrize("B", [1, 2])
+def test_mha_shapes(N, H, d, B):
+    torch.manual_seed(0)
+    Hd = H * d
+    q = torch.randn(B, N, Hd, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, N, Hd, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, N, Hd, device="cuda", dtype=torch.float32)
+    ref = _ref_mha(q, k, v, H)
+    got = multi_head_attention(q, k, v, H)
+    torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_mha_per_head_slices():
+    """Each head slice of the output must match the reference independently."""
+    B, N, H, d = 1, 128, 4, 32
+    torch.manual_seed(1)
+    q = torch.randn(B, N, H * d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, N, H * d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, N, H * d, device="cuda", dtype=torch.float32)
+    got = multi_head_attention(q, k, v, H)
+    ref = _ref_mha(q, k, v, H)
+    for h in range(H):
+        torch.testing.assert_close(
+            got[:, :, h*d:(h+1)*d], ref[:, :, h*d:(h+1)*d], atol=1e-3, rtol=1e-3
+        )
+
+
+def test_mha_matches_sdpa_single_head():
+    """With H=1, MHA output must match SDPA on the equivalent (B,1,N,d) input."""
+    import torch.nn.functional as F
+    B, N, d = 2, 128, 64
+    q = torch.randn(B, N, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(B, N, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(B, N, d, device="cuda", dtype=torch.float32)
+    mha_out = multi_head_attention(q, k, v, H=1)
+    sdpa_ref = F.scaled_dot_product_attention(
+        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), is_causal=True
+    ).squeeze(1)
+    torch.testing.assert_close(mha_out, sdpa_ref, atol=1e-3, rtol=1e-3)
