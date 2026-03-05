@@ -103,7 +103,7 @@ def flash_attention_v2_fp16_kernel(
         ).to(tl.float16)
 
         # fp16 QK^T → fp32 (Tensor Core path on T4)
-        score_tile = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+        score_tile = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
         score_tile = tl.where(kv_mask[None, :], score_tile, float("-inf"))
 
         tile_max = tl.max(score_tile, axis=1)
@@ -115,7 +115,7 @@ def flash_attention_v2_fp16_kernel(
         exp_scores = tl.exp(score_tile - new_m[:, None])   # fp32
 
         # fp16 scores · V → fp32 (Tensor Core path on T4)
-        acc += tl.dot(exp_scores.to(tl.float16), v).to(tl.float32)
+        acc += tl.dot(exp_scores.to(tl.float16), v, out_dtype=tl.float32)
         s   += tl.sum(exp_scores, axis=1)
         m    = new_m
 
@@ -136,7 +136,7 @@ def flash_attention_v2_fp16_kernel(
             other=0.0,
         ).to(tl.float16)
 
-        score_tile  = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+        score_tile  = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
         causal_mask = q_offs[:, None] >= kv_offs[None, :]
         score_tile  = tl.where(causal_mask, score_tile, float("-inf"))
         score_tile  = tl.where(kv_mask[None, :], score_tile, float("-inf"))
@@ -148,7 +148,7 @@ def flash_attention_v2_fp16_kernel(
         acc      = acc * alpha[:, None]
 
         exp_scores = tl.exp(score_tile - new_m[:, None])
-        acc += tl.dot(exp_scores.to(tl.float16), v).to(tl.float32)
+        acc += tl.dot(exp_scores.to(tl.float16), v, out_dtype=tl.float32)
         s   += tl.sum(exp_scores, axis=1)
         m    = new_m
 
