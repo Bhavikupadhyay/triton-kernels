@@ -41,15 +41,12 @@ htmlcov/
 benchmarks/results/**/*.png
 benchmarks/results/**/*.csv
 
+# Local images directory (notebook screenshots, plots saved locally)
+images/
+
 # Triton cache
 ~/.triton/
 
-# Project conventions (local only — not for public sharing)
+# Project conventions and session state (local only — not for public sharing)
 CLAUDE.md
 current_state.md
-
-# images
-images/
-*.png
-*.jpg
-*.jpeg
