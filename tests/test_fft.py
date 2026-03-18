@@ -5,7 +5,7 @@ import pytest
 from kernels.fft.fft_kernel import fft
 
 
-@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("B", [1, 8, 32])
 def test_fft_batched(N, B):
     x = torch.randn(B, N, device="cuda", dtype=torch.float32)
