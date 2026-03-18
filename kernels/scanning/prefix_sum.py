@@ -107,7 +107,8 @@ def prefix_sum_dlb_kernel(
     tl.store(prefixes_ptr + block_id, local_total)
     # 'release': all stores above this point are globally visible before any
     # thread can observe flags[block_id] transition away from FLAG_INVALID.
-    tl.atomic_xchg(flags_ptr + block_id, FLAG_PARTIAL, sem='release')
+    # Literal 1 = FLAG_PARTIAL (Triton JIT cannot read non-constexpr globals).
+    tl.atomic_xchg(flags_ptr + block_id, 1, sem='release')
 
     # ── Look-back: accumulate carry from predecessor blocks ───────────────────
     aggregate    = 0.0
@@ -117,15 +118,16 @@ def prefix_sum_dlb_kernel(
         # Spin until predecessor has published at least a partial prefix.
         # 'acquire': once we observe f != FLAG_INVALID, the corresponding
         # prefixes[] value written before the release flag is also visible.
+        # Literal 0 = FLAG_INVALID, 2 = FLAG_INCLUSIVE
         f = tl.atomic_add(flags_ptr + look_back_id, 0, sem='acquire')
-        while f == FLAG_INVALID:
+        while f == 0:
             f = tl.atomic_add(flags_ptr + look_back_id, 0, sem='acquire')
 
         # Safe to load now — ordered after the acquire above.
         val        = tl.load(prefixes_ptr + look_back_id)
         aggregate += val
 
-        if f == FLAG_INCLUSIVE:
+        if f == 2:
             # This predecessor already has all prior carry summed in — stop.
             look_back_id = -1   # exits the outer while on next check
         else:
@@ -134,7 +136,8 @@ def prefix_sum_dlb_kernel(
 
     # ── Publish inclusive prefix ──────────────────────────────────────────────
     tl.store(prefixes_ptr + block_id, local_total + aggregate)
-    tl.atomic_xchg(flags_ptr + block_id, FLAG_INCLUSIVE, sem='release')
+    # Literal 2 = FLAG_INCLUSIVE
+    tl.atomic_xchg(flags_ptr + block_id, 2, sem='release')
 
     # ── Write final output ────────────────────────────────────────────────────
     tl.store(out_ptr + offs, local_scan + aggregate, mask=mask)
