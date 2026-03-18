@@ -17,7 +17,8 @@ import math
 
 @triton.jit
 def fft_kernel(
-    re_ptr, im_ptr,            # in-place buffer (bit-reversed input on entry)
+    re0_ptr, im0_ptr,          # ping buffer (bit-reversed input on entry)
+    re1_ptr, im1_ptr,          # pong buffer (scratch; output of odd stages)
     N,                          # row length (runtime int)
     LOG2_N: tl.constexpr,      # log2(N); controls compile-time loop unroll count
     BLOCK_SIZE: tl.constexpr,  # == N
@@ -28,12 +29,14 @@ def fft_kernel(
     Design rationale:
     - for s in range(LOG2_N) is compile-time unrolled (LOG2_N is tl.constexpr),
       so s, half, and angle_scale are Python-level constants at JIT trace time.
-    - In-place operation: each stage loads all N elements, computes butterflies,
-      stores all N results back to the same buffer.
+    - Ping-pong buffers: each stage reads from src and writes to dst, where
+      src/dst alternate based on stage parity. This eliminates the intra-stage
+      race that in-place updates introduce when butterfly partners span warp
+      boundaries (half >= warp_elements = BLOCK_SIZE / (num_warps * 32)).
     - tl.debug_barrier() between stages is bar.sync 0 in PTX (__syncthreads__) —
-      required for stages where half >= 32 (partners span warp boundaries).
-    - vs per-stage-kernel design: eliminates log2(N)-1 kernel launch round-trips
-      (~5us each). Intermediate data hits L2 cache for N <= ~256K complex fp32.
+      ensures all warps finish writing dst before any warp reads dst as src in
+      the next stage.
+    - Result is in buf0 if LOG2_N is even, buf1 if LOG2_N is odd.
     """
     batch_id = tl.program_id(0)
     base = batch_id * N
@@ -54,10 +57,21 @@ def fft_kernel(
         w_re  = tl.cos(angle)
         w_im  = tl.sin(angle)
 
-        cur_re = tl.load(re_ptr + base + offs,    mask=mask, other=0.0).to(tl.float32)
-        cur_im = tl.load(im_ptr + base + offs,    mask=mask, other=0.0).to(tl.float32)
-        par_re = tl.load(re_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
-        par_im = tl.load(im_ptr + base + partner, mask=mask, other=0.0).to(tl.float32)
+        # Select source and destination buffers based on stage parity.
+        # s is a Python int at trace time (loop unrolled), so this if/else
+        # is evaluated at compile time — each unrolled stage has hardcoded
+        # src/dst pointers with no runtime branch.
+        if s % 2 == 0:
+            src_re, src_im = re0_ptr, im0_ptr
+            dst_re, dst_im = re1_ptr, im1_ptr
+        else:
+            src_re, src_im = re1_ptr, im1_ptr
+            dst_re, dst_im = re0_ptr, im0_ptr
+
+        cur_re = tl.load(src_re + base + offs,    mask=mask, other=0.0).to(tl.float32)
+        cur_im = tl.load(src_im + base + offs,    mask=mask, other=0.0).to(tl.float32)
+        par_re = tl.load(src_re + base + partner, mask=mask, other=0.0).to(tl.float32)
+        par_im = tl.load(src_im + base + partner, mask=mask, other=0.0).to(tl.float32)
 
         even_re = tl.where(is_top, cur_re, par_re)
         even_im = tl.where(is_top, cur_im, par_im)
@@ -70,8 +84,8 @@ def fft_kernel(
         new_re = tl.where(is_top, even_re + tw_re, even_re - tw_re)
         new_im = tl.where(is_top, even_im + tw_im, even_im - tw_im)
 
-        tl.store(re_ptr + base + offs, new_re, mask=mask)
-        tl.store(im_ptr + base + offs, new_im, mask=mask)
+        tl.store(dst_re + base + offs, new_re, mask=mask)
+        tl.store(dst_im + base + offs, new_im, mask=mask)
         tl.debug_barrier()
 
 
@@ -101,7 +115,7 @@ def fft(x: torch.Tensor) -> torch.Tensor:
 
     log2_n = int(math.log2(N))
 
-    # Bit-reversal permutation (CPU, vectorised) — unchanged from prior design
+    # Bit-reversal permutation (CPU, vectorised)
     indices = torch.arange(N, dtype=torch.int64)
     rev = torch.zeros(N, dtype=torch.int64)
     tmp = indices.clone()
@@ -109,25 +123,30 @@ def fft(x: torch.Tensor) -> torch.Tensor:
         rev = (rev << 1) | (tmp & 1)
         tmp = tmp >> 1
 
-    # Apply bit-reversal to input; imaginary part starts at zero
-    buf_re = x[:, rev].contiguous().clone()
-    buf_im = torch.zeros(B, N, device=x.device)
+    # Ping buffer: bit-reversed input. Pong buffer: scratch.
+    buf_re = [x[:, rev].contiguous().clone(), torch.empty(B, N, device=x.device)]
+    buf_im = [torch.zeros(B, N, device=x.device),  torch.zeros(B, N, device=x.device)]
 
     # Single kernel launch — all stages run inside the kernel.
-    # num_warps scales with N to keep elements-per-thread ~32, avoiding register
-    # spilling at large N (N=8192 with num_warps=4 gives 64 elements/thread,
-    # which exceeds T4's 255-register-per-thread limit and causes L1 spills).
+    # num_warps scales with N to keep ~16 elements per hardware thread,
+    # avoiding register pressure at large N.
     num_warps = max(4, N // 512)
-    fft_kernel[(B,)](buf_re, buf_im, N, LOG2_N=log2_n, BLOCK_SIZE=N, num_warps=num_warps)
+    fft_kernel[(B,)](
+        buf_re[0], buf_im[0],
+        buf_re[1], buf_im[1],
+        N, LOG2_N=log2_n, BLOCK_SIZE=N, num_warps=num_warps,
+    )
 
-    result = torch.complex(buf_re, buf_im)
+    # Result is in buf0 if LOG2_N is even, buf1 if LOG2_N is odd.
+    result_idx = log2_n % 2
+    result = torch.complex(buf_re[result_idx], buf_im[result_idx])
     return result.squeeze(0) if squeeze else result
 
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
 def test_fft():
-    print("Testing fft (fft_kernel — single launch, all stages)...")
+    print("Testing fft (fft_kernel — single launch, ping-pong stages)...")
 
     for N in [64, 128, 256, 512, 1024, 2048, 4096, 8192]:
         x = torch.randn(16, N, device="cuda", dtype=torch.float32)
