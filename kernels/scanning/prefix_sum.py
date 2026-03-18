@@ -67,7 +67,7 @@ import triton.language as tl
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BLOCK_SIZE    = 1024
+BLOCK_SIZE    = 4096
 FLAG_INVALID  = 0
 FLAG_PARTIAL  = 1
 FLAG_INCLUSIVE = 2
