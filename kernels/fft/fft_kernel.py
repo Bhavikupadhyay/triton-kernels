@@ -113,8 +113,12 @@ def fft(x: torch.Tensor) -> torch.Tensor:
     buf_re = x[:, rev].contiguous().clone()
     buf_im = torch.zeros(B, N, device=x.device)
 
-    # Single kernel launch — all stages run inside the kernel
-    fft_kernel[(B,)](buf_re, buf_im, N, LOG2_N=log2_n, BLOCK_SIZE=N)
+    # Single kernel launch — all stages run inside the kernel.
+    # num_warps scales with N to keep elements-per-thread ~32, avoiding register
+    # spilling at large N (N=8192 with num_warps=4 gives 64 elements/thread,
+    # which exceeds T4's 255-register-per-thread limit and causes L1 spills).
+    num_warps = max(4, N // 512)
+    fft_kernel[(B,)](buf_re, buf_im, N, LOG2_N=log2_n, BLOCK_SIZE=N, num_warps=num_warps)
 
     result = torch.complex(buf_re, buf_im)
     return result.squeeze(0) if squeeze else result
