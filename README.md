@@ -68,9 +68,9 @@ tiled_matmul matches cuBLAS within 1% at N=4096. batched_matmul (B=16) is 10–1
 
 | Kernel | File | Notes |
 |---|---|---|
-| Cooley-Tukey FFT | `kernels/fft/fft_kernel.py` | Radix-2 DIT; in-SRAM butterfly for N≤8192 |
+| Cooley-Tukey FFT | `kernels/fft/fft_kernel.py` | Radix-2 DIT; single-kernel ping-pong, all stages in one launch |
 
-~1200 GFLOPS at N=4096 vs ~420 GFLOPS (`torch.fft.fft`). Single-pass in-SRAM execution avoids the HBM round-trips that cuFFT incurs for multi-pass plans at small N.
+56.9 GFLOPS (Triton) vs 578.3 GFLOPS (cuFFT) at N=4096; 55.5 vs 689.7 at N=8192. Single kernel eliminates 11 of 12 launches vs the per-stage design (23.9 → 56.9 GFLOPS at N=4096). Remaining 10× gap: all log2(N) stages pass through L2 ping-pong buffers; cuFFT tiles multiple stages inside shared memory.
 
 ---
 
