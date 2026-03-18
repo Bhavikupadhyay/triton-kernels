@@ -37,10 +37,10 @@ reduce_sum exceeds the 241 GB/s elementwise ceiling because it is read-only (no 
 
 | Kernel | File | PyTorch equivalent | Notes |
 |---|---|---|---|
-| Prefix sum | `kernels/scanning/prefix_sum.py` | `x.cumsum(0)` | 158 GB/s at n=512K; 2× gap at large n vs PyTorch |
+| Prefix sum | `kernels/scanning/prefix_sum.py` | `x.cumsum(0)` | ~234 GB/s at n=16M; matches PyTorch |
 | Cummax | `kernels/scanning/cummax.py` | `x.cummax(0)` | ~50× ahead of PyTorch at n=16M |
 
-Both use three kernel launches communicating through global memory — a consequence of Triton's single-tier model (no cross-block sync within one launch). `torch.cummax` uses a near-sequential CUDA kernel; the parallel scan is ~50× faster at large n.
+prefix_sum uses a single-pass decoupled look-back (DLB) — 2n HBM traffic, matching CUB. cummax uses three kernel launches (4n HBM). `torch.cummax` uses a near-sequential CUDA kernel; the parallel scan is ~50× faster at large n.
 
 ---
 
