@@ -127,12 +127,11 @@ def prefix_sum_dlb_kernel(
         val        = tl.load(prefixes_ptr + look_back_id)
         aggregate += val
 
-        if f == 2:
-            # This predecessor already has all prior carry summed in — stop.
-            look_back_id = -1   # exits the outer while on next check
-        else:
-            # Only a partial (local) total — keep looking back.
-            look_back_id -= 1
+        # tl.where keeps look_back_id as a Triton tensor in all branches,
+        # satisfying the SSA phi-node type constraint for the while loop.
+        # f==2 (FLAG_INCLUSIVE): set to -1 → outer while exits next check.
+        # f==1 (FLAG_PARTIAL):   decrement → keep looking back.
+        look_back_id = tl.where(f == 2, -1, look_back_id - 1)
 
     # ── Publish inclusive prefix ──────────────────────────────────────────────
     tl.store(prefixes_ptr + block_id, local_total + aggregate)
