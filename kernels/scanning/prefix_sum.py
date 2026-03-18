@@ -85,7 +85,9 @@ def _add(a, b):
 @triton.jit
 def prefix_sum_dlb_kernel(
     x_ptr, out_ptr,
-    flags_ptr, prefixes_ptr,
+    flags_ptr,
+    partial_ptr,    # local block total — written once before FLAG_PARTIAL
+    inclusive_ptr,  # full inclusive prefix — written once before FLAG_INCLUSIVE
     counter_ptr,
     n: int,
     BLOCK_SIZE: tl.constexpr,
@@ -103,11 +105,14 @@ def prefix_sum_dlb_kernel(
     local_scan  = tl.associative_scan(x, axis=0, combine_fn=_add)
     local_total = tl.sum(x, axis=0)
 
-    # ── Publish partial prefix (local total only) ─────────────────────────────
-    tl.store(prefixes_ptr + block_id, local_total)
-    # 'release': all stores above this point are globally visible before any
-    # thread can observe flags[block_id] transition away from FLAG_INVALID.
-    # Literal 1 = FLAG_PARTIAL (Triton JIT cannot read non-constexpr globals).
+    # ── Publish partial (local total, no carry) ───────────────────────────────
+    # partial_ptr and inclusive_ptr are separate arrays — each slot is written
+    # exactly once before its corresponding flag transition.  This prevents the
+    # race where a consumer reads FLAG_PARTIAL but observes an already-overwritten
+    # inclusive value (which would cause double-counting in the look-back).
+    tl.store(partial_ptr + block_id, local_total)
+    # 'release': partial store above is visible before flag transitions.
+    # Literal 1 = FLAG_PARTIAL  (Triton JIT cannot read non-constexpr globals)
     tl.atomic_xchg(flags_ptr + block_id, 1, sem='release')
 
     # ── Look-back: accumulate carry from predecessor blocks ───────────────────
@@ -115,26 +120,30 @@ def prefix_sum_dlb_kernel(
     look_back_id = block_id - 1
 
     while look_back_id >= 0:
-        # Spin until predecessor has published at least a partial prefix.
-        # 'acquire': once we observe f != FLAG_INVALID, the corresponding
-        # prefixes[] value written before the release flag is also visible.
-        # Literal 0 = FLAG_INVALID, 2 = FLAG_INCLUSIVE
+        # Spin until predecessor has published at least FLAG_PARTIAL.
+        # 'acquire': once f != 0 is visible, the prefix store that preceded
+        # that flag's 'release' write is also visible.
+        # Literal 0 = FLAG_INVALID, 1 = FLAG_PARTIAL, 2 = FLAG_INCLUSIVE
         f = tl.atomic_add(flags_ptr + look_back_id, 0, sem='acquire')
         while f == 0:
             f = tl.atomic_add(flags_ptr + look_back_id, 0, sem='acquire')
 
-        # Safe to load now — ordered after the acquire above.
-        val        = tl.load(prefixes_ptr + look_back_id)
+        # Select the right array based on the flag.  Both loads execute
+        # (Triton does not short-circuit), but both pointers are valid, so
+        # loading both is safe.  tl.where picks the correct value.
+        partial_val   = tl.load(partial_ptr   + look_back_id)
+        inclusive_val = tl.load(inclusive_ptr + look_back_id)
+        val        = tl.where(f == 1, partial_val, inclusive_val)
         aggregate += val
 
         # tl.where keeps look_back_id as a Triton tensor in all branches,
         # satisfying the SSA phi-node type constraint for the while loop.
-        # f==2 (FLAG_INCLUSIVE): set to -1 → outer while exits next check.
-        # f==1 (FLAG_PARTIAL):   decrement → keep looking back.
+        # f==2: set to -1 → outer while exits. f==1: decrement → keep looking.
         look_back_id = tl.where(f == 2, -1, look_back_id - 1)
 
     # ── Publish inclusive prefix ──────────────────────────────────────────────
-    tl.store(prefixes_ptr + block_id, local_total + aggregate)
+    # Written to inclusive_ptr — never overwrites partial_ptr. ✓
+    tl.store(inclusive_ptr + block_id, local_total + aggregate)
     # Literal 2 = FLAG_INCLUSIVE
     tl.atomic_xchg(flags_ptr + block_id, 2, sem='release')
 
@@ -154,12 +163,13 @@ def prefix_sum(x: torch.Tensor) -> torch.Tensor:
 
     out      = torch.empty(n,          device=x.device, dtype=torch.float32)
     flags    = torch.zeros(num_blocks, device=x.device, dtype=torch.int32)
-    prefixes = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
+    partial  = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
+    inclusive = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
     counter  = torch.zeros(1,          device=x.device, dtype=torch.int32)
 
     prefix_sum_dlb_kernel[(num_blocks,)](
         x.float(), out,
-        flags, prefixes, counter,
+        flags, partial, inclusive, counter,
         n, BLOCK_SIZE=BLOCK_SIZE,
     )
     return out
