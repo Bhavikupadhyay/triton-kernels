@@ -255,9 +255,9 @@ def test_conv1d():
         x_vals=[2**i for i in range(10, 18)],
         x_log=True,
         line_arg="provider",
-        line_vals=["triton", "triton-fp16", "torch"],
-        line_names=["Triton (implicit GEMM, fp32)", "Triton (implicit GEMM, fp16)", "PyTorch (F.conv1d, fp32)"],
-        styles=[("blue", "-"), ("blue", "--"), ("green", ":")],
+        line_vals=["triton", "torch"],
+        line_names=["Triton (implicit GEMM, fp32)", "PyTorch (F.conv1d, fp32)"],
+        styles=[("blue", "-"), ("green", ":")],
         ylabel="TFLOPS",
         plot_name="conv1d",
         args={"B": 1, "C_in": 128, "C_out": 128, "K": 7},
@@ -266,18 +266,12 @@ def test_conv1d():
 def benchmark_conv1d(B, C_in, C_out, K, N, provider):
     x         = torch.randn(B, C_in, N,     device="cuda", dtype=torch.float32)
     w         = torch.randn(C_out, C_in, K, device="cuda", dtype=torch.float32)
-    x16       = x.to(torch.float16)
-    w16       = w.to(torch.float16)
     N_out     = N - K + 1
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: conv1d(x, w), warmup=25, rep=100, quantiles=quantiles
-        )
-    elif provider == "triton-fp16":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: conv1d(x16, w16), warmup=25, rep=100, quantiles=quantiles
         )
     else:
         ms, min_ms, max_ms = triton.testing.do_bench(
