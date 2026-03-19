@@ -174,7 +174,7 @@ from kernels.attention.flash_attention_v2 import flash_attention_v2
 
 # ── flash_attention_v2 ────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("N", [64, 128, 256, 512, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("d", [32, 64])
 @pytest.mark.parametrize("B,H", [(1, 1), (2, 4)])
 def test_flash_v2_shapes(N, d, B, H):

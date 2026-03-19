@@ -18,10 +18,14 @@ import torch.nn.functional as F
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},  num_warps=4),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},  num_warps=4),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32},  num_warps=4),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128}, num_warps=8),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32},  num_warps=8),
     ],
     key=["N", "d"],
 )
@@ -216,7 +220,7 @@ def test_flash_attention_v2():
     print("Testing flash_attention_v2...")
 
     torch.manual_seed(0)
-    for N in [64, 128, 256, 512, 1024, 2048, 4096]:
+    for N in [64, 128, 256, 512, 1024, 2048, 4096, 8192]:
         for d in [32, 64]:
             B, H = 2, 4
             q = torch.randn(B, H, N, d, device="cuda", dtype=torch.float32)
@@ -237,7 +241,7 @@ def test_flash_attention_v2():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N"],
-        x_vals=[128, 256, 512, 1024, 2048, 4096],
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
         x_log=True,
         line_arg="provider",
         line_vals=["triton_v2", "triton_v1", "torch"],

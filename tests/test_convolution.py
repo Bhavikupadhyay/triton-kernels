@@ -6,6 +6,7 @@ import pytest
 from kernels.convolution.conv1d import conv1d
 from kernels.convolution.conv2d import conv2d
 from kernels.convolution.depthwise_conv2d import depthwise_conv2d
+from kernels.convolution.winograd_conv2d import winograd_conv2d
 
 import torch.nn.functional as F
 
@@ -68,3 +69,25 @@ def test_depthwise_conv2d(B, C, H, W, K, dtype):
     got = depthwise_conv2d(x, wt)
     tol = dict(rtol=1e-2, atol=1e-2) if dtype == torch.float16 else dict(rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(got, ref, **tol)
+
+
+# ── winograd_conv2d ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("B,C_in,C_out,H,W", [
+    (1,  1,   1,   4,   4),
+    (1,  3,   8,   8,   8),
+    (2,  4,   8,   16,  16),
+    (1,  16,  32,  32,  32),
+    (2,  32,  64,  32,  32),
+    (1,  64,  64,  56,  56),
+    # Non-power-of-2 outputs — tests partial last tile
+    (1,  3,   8,   9,   9),
+    (1,  4,   4,   11,  11),
+])
+def test_winograd_conv2d(B, C_in, C_out, H, W):
+    torch.manual_seed(0)
+    x  = torch.randn(B, C_in, H, W,     device="cuda", dtype=torch.float32)
+    wt = torch.randn(C_out, C_in, 3, 3, device="cuda", dtype=torch.float32)
+    ref = F.conv2d(x, wt, padding=0)
+    got = winograd_conv2d(x, wt)
+    torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
