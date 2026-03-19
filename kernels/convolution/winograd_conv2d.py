@@ -15,7 +15,7 @@ Algorithm — Winograd F(2,3):
 
   1. Weight transform:  U_t = G × g × G^T       (3×3 → 4×4, once per forward call)
   2. Input transform:   V_t = B^T × d × B       (4×4 input patch → 4×4 transform)
-  3. GEMM per (b, p):  M_t[b, p] = U_t[p] @ V_t[b, p]  (C_out × N_tiles, tl.dot)
+  3. GEMM per (b, p):  M_t[b, p] = V_t[b, p] @ U_t[p]^T  (N_tiles × C_out, tl.dot)
   4. Output transform:  Y = A^T × m × A         (4×4 transform → 2×2 output patch)
 
   Transformation matrices (Lavin & Gray 2015, exact rational values):
@@ -44,13 +44,13 @@ Algorithm — Winograd F(2,3):
     H_tiles = cdiv(H_out, 2),  W_tiles = cdiv(W_out, 2)
     Each tile produces a 2×2 output patch. Partial boundary tiles use mask= on store.
 
-  GEMM-friendly intermediate layout (position-outermost for contiguous tl.dot access):
+  Memory layout (C_in innermost for coalesced GEMM loads):
     U_t : (16, C_out, C_in)      — for each p: U_t[p, :, :] is a contiguous (C_out, C_in) slice
-    V_t : (B, 16, C_in, N_tiles) — for (b, p): V_t[b, p, :, :] is contiguous (C_in, N_tiles)
-    M_t : (B, 16, C_out, N_tiles)
+    V_t : (B, 16, N_tiles, C_in) — C_in innermost; GEMM K-loop reads are contiguous (stride=1)
+    M_t : (B, 16, N_tiles, C_out)
 
-  Step 3 GEMM: M_t[b, p, :, :] = U_t[p, :, :] @ V_t[b, p, :, :]
-    = (C_out, C_in) @ (C_in, N_tiles) → (C_out, N_tiles).
+  Step 3 GEMM: M_t[b, p, :, :] = V_t[b, p, :, :] @ U_t[p, :, :]^T
+    = (N_tiles, C_in) @ (C_in, C_out) → (N_tiles, C_out).
   16 × B independent GEMMs, each dispatched as one Triton program group.
   M_t is permuted to (B, C_out, N_tiles, 16) before the output transform kernel.
 
@@ -136,12 +136,16 @@ def winograd_weight_transform_kernel(
 @triton.jit
 def winograd_input_transform_kernel(
     x_ptr,    # (B, C_in, H, W)
-    v_t_ptr,  # (B, 16, C_in, N_tiles)
+    v_t_ptr,  # (B, 16, N_tiles, C_in)  — C_in innermost for coalesced GEMM reads
     C_in, H, W, H_tiles, W_tiles,
     stride_xb, stride_xci, stride_xh, stride_xw,
-    stride_vt_b, stride_vt_p, stride_vt_ci, stride_vt_n,
+    stride_vt_b, stride_vt_p, stride_vt_n, stride_vt_ci,
 ):
-    """Apply B^T × d × B to each 4×4 input patch → V_t[b, p, c_in, tile_idx].
+    """Apply B^T × d × B to each 4×4 input patch → V_t[b, p, tile_idx, c_in].
+
+    New layout V_t[b, 16, N_tiles, C_in]: C_in is innermost (stride=1).
+    The 16 scalar stores per program are strided by stride_vt_p = N_tiles * C_in apart,
+    but the GEMM inner K-loop reads along the C_in dimension contiguously.
 
     tl.load with mask+other handles boundary zero-padding without branching.
     """
@@ -187,8 +191,10 @@ def winograd_input_transform_kernel(
     v20 = i20-i22;  v21 = i21+i22;  v22 = -i21+i22; v23 = i21-i23
     v30 = i30-i32;  v31 = i31+i32;  v32 = -i31+i32; v33 = i31-i33
 
+    # V_t[b, p, tile_idx, c_in]: tile_idx × stride_vt_n + c_in × stride_vt_ci
+    # stride_vt_ci = 1 (C_in innermost), stride_vt_n = C_in
     tile_idx = pid_ht * W_tiles + pid_wt
-    v_t_base = v_t_ptr + pid_b * stride_vt_b + pid_ci * stride_vt_ci + tile_idx * stride_vt_n
+    v_t_base = v_t_ptr + pid_b * stride_vt_b + tile_idx * stride_vt_n + pid_ci * stride_vt_ci
 
     tl.store(v_t_base +  0 * stride_vt_p, v00)
     tl.store(v_t_base +  1 * stride_vt_p, v01)
@@ -222,62 +228,69 @@ def winograd_input_transform_kernel(
 @triton.jit
 def winograd_dot_kernel(
     u_t_ptr,  # (16, C_out, C_in)
-    v_t_ptr,  # (B, 16, C_in, N_tiles)
-    m_t_ptr,  # (B, 16, C_out, N_tiles)
+    v_t_ptr,  # (B, 16, N_tiles, C_in)  — C_in innermost
+    m_t_ptr,  # (B, 16, N_tiles, C_out)
     C_in, C_out, N_tiles, B,
     stride_ut_p,  stride_ut_co, stride_ut_ci,
-    stride_vt_b,  stride_vt_p,  stride_vt_ci, stride_vt_n,
-    stride_mt_b,  stride_mt_p,  stride_mt_co, stride_mt_n,
+    stride_vt_b,  stride_vt_p,  stride_vt_n,  stride_vt_ci,
+    stride_mt_b,  stride_mt_p,  stride_mt_n,  stride_mt_co,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """
-    M_t[b, p, :, :] = U_t[p, :, :] @ V_t[b, p, :, :]
-      = (C_out, C_in) @ (C_in, N_tiles) → (C_out, N_tiles)
+    M_t[b, p, :, :] = V_t[b, p, :, :] @ U_t[p, :, :]^T
+      = (N_tiles, C_in) @ (C_in, C_out) → (N_tiles, C_out)
 
-    Grid: (16 * B, cdiv(C_out, BLOCK_M), cdiv(N_tiles, BLOCK_N))
+    V_t has C_in innermost (stride_vt_ci=1), so the K-loop loads are contiguous.
+    U_t[p] is (C_out, C_in); loaded transposed as (C_in, C_out) for the right-hand factor.
+
+    Grid: (16 * B, cdiv(N_tiles, BLOCK_M), cdiv(C_out, BLOCK_N))
     """
     pid_pb = tl.program_id(0)
-    pid_m  = tl.program_id(1)
-    pid_n  = tl.program_id(2)
+    pid_m  = tl.program_id(1)   # N_tiles dimension
+    pid_n  = tl.program_id(2)   # C_out dimension
 
     p = pid_pb // B
     b = pid_pb %  B
 
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # (BLOCK_M,)
-    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # (BLOCK_N,)
-    mask_m = m_offs < C_out
-    mask_n = n_offs < N_tiles
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # (BLOCK_M,) — N_tiles
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # (BLOCK_N,) — C_out
+    mask_m = m_offs < N_tiles
+    mask_n = n_offs < C_out
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k_start in range(0, C_in, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,)
+        k_offs = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,) — C_in
         mask_k = k_offs < C_in
 
-        # Load U_t[p, m_offs, k_offs] — shape (BLOCK_M, BLOCK_K)
-        u_tile = tl.load(
-            u_t_ptr + p * stride_ut_p
-                    + m_offs[:, None] * stride_ut_co
-                    + k_offs[None, :] * stride_ut_ci,
-            mask=mask_m[:, None] & mask_k[None, :],
-            other=0.0,
-        )
-        # Load V_t[b, p, k_offs, n_offs] — shape (BLOCK_K, BLOCK_N)
+        # Load V_t[b, p, m_offs, k_offs] — shape (BLOCK_M, BLOCK_K)
+        # stride_vt_ci = 1 → k dimension is contiguous; this is the key layout fix
         v_tile = tl.load(
             v_t_ptr + b * stride_vt_b
                     + p * stride_vt_p
-                    + k_offs[:, None] * stride_vt_ci
-                    + n_offs[None, :] * stride_vt_n,
+                    + m_offs[:, None] * stride_vt_n
+                    + k_offs[None, :] * stride_vt_ci,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Load U_t[p, n_offs, k_offs]^T — shape (BLOCK_K, BLOCK_N)
+        # U_t[p] is (C_out, C_in); index as [n, k] to get the (C_in, C_out) layout
+        u_tile = tl.load(
+            u_t_ptr + p * stride_ut_p
+                    + n_offs[None, :] * stride_ut_co
+                    + k_offs[:, None] * stride_ut_ci,
             mask=mask_k[:, None] & mask_n[None, :],
             other=0.0,
         )
-        acc = tl.dot(u_tile, v_tile, acc)
+
+        acc = tl.dot(v_tile, u_tile, acc)
 
     tl.store(
         m_t_ptr + b * stride_mt_b
                 + p * stride_mt_p
-                + m_offs[:, None] * stride_mt_co
-                + n_offs[None, :] * stride_mt_n,
+                + m_offs[:, None] * stride_mt_n
+                + n_offs[None, :] * stride_mt_co,
         acc,
         mask=mask_m[:, None] & mask_n[None, :],
     )
@@ -370,8 +383,8 @@ def winograd_conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     N_tiles = H_tiles * W_tiles
 
     U_t = torch.empty((16, C_out, C_in),             device=x.device, dtype=torch.float32)
-    V_t = torch.empty((B, 16, C_in, N_tiles),         device=x.device, dtype=torch.float32)
-    M_t = torch.empty((B, 16, C_out, N_tiles),        device=x.device, dtype=torch.float32)
+    V_t = torch.empty((B, 16, N_tiles, C_in),         device=x.device, dtype=torch.float32)
+    M_t = torch.empty((B, 16, N_tiles, C_out),        device=x.device, dtype=torch.float32)
     Y   = torch.empty((B, C_out, H_out, W_out),       device=x.device, dtype=torch.float32)
 
     # Kernel 1: weight transform — (C_out, C_in) grid → U_t: (16, C_out, C_in)
@@ -382,20 +395,20 @@ def winograd_conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         U_t.stride(0), U_t.stride(1), U_t.stride(2),   # stride_ut_p, stride_ut_co, stride_ut_ci
     )
 
-    # Kernel 2: input transform — (B*C_in, H_tiles, W_tiles) grid → V_t: (B, 16, C_in, N_tiles)
+    # Kernel 2: input transform — (B*C_in, H_tiles, W_tiles) grid → V_t: (B, 16, N_tiles, C_in)
     winograd_input_transform_kernel[(B * C_in, H_tiles, W_tiles)](
         x, V_t,
         C_in, H, W, H_tiles, W_tiles,
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        V_t.stride(0), V_t.stride(1), V_t.stride(2), V_t.stride(3),   # vt_b, vt_p, vt_ci, vt_n
+        V_t.stride(0), V_t.stride(1), V_t.stride(2), V_t.stride(3),   # vt_b, vt_p, vt_n, vt_ci
     )
 
-    # Kernel 3: GEMM — grid (16*B, cdiv(C_out, BLOCK_M), cdiv(N_tiles, BLOCK_N))
-    # M_t[b, p, :, :] = U_t[p, :, :] @ V_t[b, p, :, :]  (C_out, C_in) @ (C_in, N_tiles)
+    # Kernel 3: GEMM — grid (16*B, cdiv(N_tiles, BLOCK_M), cdiv(C_out, BLOCK_N))
+    # M_t[b, p, :, :] = V_t[b, p, :, :] @ U_t[p, :, :]^T  (N_tiles, C_in) @ (C_in, C_out)
     grid_dot = lambda meta: (
         16 * B,
-        triton.cdiv(C_out, meta["BLOCK_M"]),
-        triton.cdiv(N_tiles, meta["BLOCK_N"]),
+        triton.cdiv(N_tiles, meta["BLOCK_M"]),
+        triton.cdiv(C_out, meta["BLOCK_N"]),
     )
     winograd_dot_kernel[grid_dot](
         U_t, V_t, M_t,
@@ -405,8 +418,8 @@ def winograd_conv2d(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         M_t.stride(0), M_t.stride(1), M_t.stride(2), M_t.stride(3),
     )
 
-    # Permute M_t → (B, C_out, N_tiles, 16), then reshape for output transform kernel
-    M    = M_t.permute(0, 2, 3, 1).contiguous()    # (B, C_out, N_tiles, 16)
+    # Permute M_t: (B, 16, N_tiles, C_out) → (B, C_out, N_tiles, 16), then reshape for output transform
+    M    = M_t.permute(0, 3, 2, 1).contiguous()    # (B, C_out, N_tiles, 16)
     M_5d = M.view(B, C_out, H_tiles, W_tiles, 16)
 
     # Kernel 4: output transform — (B*C_out, H_tiles, W_tiles) grid (unchanged)
