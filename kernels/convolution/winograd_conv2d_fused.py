@@ -118,16 +118,26 @@ def winograd_weight_transform_kernel(
 
 @triton.autotune(
     configs=[
+        # BLOCK_K=32
         triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 32, "BLOCK_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 64, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+        # BLOCK_K=16
         triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 32, "BLOCK_K": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 32, "BLOCK_K": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 64, "BLOCK_K": 16}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 64, "BLOCK_K": 16}, num_warps=8, num_stages=2),
+        # BLOCK_K=64 — single C_in loop iteration when C_in=64; ci_mask handles C_in < BLOCK_K
+        triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 32, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 32, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 64, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_TILES": 16, "BLOCK_CO": 64, "BLOCK_K": 64}, num_warps=8, num_stages=4),
+        # BLOCK_K=32 with higher num_stages — better pipelining now that loads are coalesced
+        triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 32, "BLOCK_K": 32}, num_warps=4, num_stages=5),
+        triton.Config({"BLOCK_TILES": 32, "BLOCK_CO": 64, "BLOCK_K": 32}, num_warps=8, num_stages=5),
     ],
-    key=["N_tiles", "C_in", "C_out"],
+    key=["N_tiles", "C_in", "C_out", "H", "W"],
 )
 @triton.jit
 def winograd_fused_kernel(
@@ -378,7 +388,6 @@ def winograd_conv2d_fused(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     # U_t layout: (16, C_in, C_out) — C_in outer, C_out inner (stride=1)
     # A (BLOCK_K, BLOCK_CO) slice [ci_block, co_block] is row-major → valid tl.dot B operand.
     U_t = torch.empty((16, C_in, C_out), device=x.device, dtype=torch.float32)
-    Y   = torch.empty((B, C_out, H_out, W_out), device=x.device, dtype=torch.float32)
 
     # Kernel 1: weight transform — (C_out, C_in) grid → U_t: (16, C_in, C_out)
     winograd_weight_transform_kernel[(C_out, C_in)](
@@ -388,6 +397,16 @@ def winograd_conv2d_fused(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         U_t.stride(0), U_t.stride(1), U_t.stride(2),
     )
 
+    # Permute input to NHWC so stride_xci=1 — the BLOCK_K (C_in) axis in the fused
+    # kernel becomes stride-1, giving perfectly coalesced d_rc loads.
+    # NCHW stride_xci = H*W (e.g. 65536 at H=256) → BLOCK_K elements 256 KB apart → 32 cache misses/row.
+    # NHWC stride_xci = 1 → entire BLOCK_K row is one contiguous transaction.
+    x_nhwc = x.permute(0, 2, 3, 1).contiguous()   # (B, H, W, C_in)
+
+    # Allocate output in NHWC so stride_yco=1 — the BLOCK_CO axis in the output stores
+    # becomes stride-1, replacing scatter writes with one contiguous transaction per tile.
+    Y_nhwc = torch.empty((B, H_out, W_out, C_out), device=x.device, dtype=torch.float32)
+
     # Kernel 2: fused input transform + tl.dot accumulate + output transform
     grid = lambda meta: (
         triton.cdiv(N_tiles, meta["BLOCK_TILES"]),
@@ -395,13 +414,15 @@ def winograd_conv2d_fused(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         B,
     )
     winograd_fused_kernel[grid](
-        x, U_t, Y,
+        x_nhwc, U_t, Y_nhwc,
         B, C_in, C_out, H, W, H_out, W_out, H_tiles, W_tiles, N_tiles,
-        x.stride(0),   x.stride(1),   x.stride(2),   x.stride(3),
-        U_t.stride(0), U_t.stride(1), U_t.stride(2),
-        Y.stride(0),   Y.stride(1),   Y.stride(2),   Y.stride(3),
+        x_nhwc.stride(0), x_nhwc.stride(3), x_nhwc.stride(1), x_nhwc.stride(2),
+        U_t.stride(0),    U_t.stride(1),    U_t.stride(2),
+        Y_nhwc.stride(0), Y_nhwc.stride(3), Y_nhwc.stride(1), Y_nhwc.stride(2),
     )
-    return Y
+
+    # Permute output back to NCHW for the caller.
+    return Y_nhwc.permute(0, 3, 1, 2).contiguous()
 
 
 # ── 4. Correctness tests ──────────────────────────────────────────────────────
