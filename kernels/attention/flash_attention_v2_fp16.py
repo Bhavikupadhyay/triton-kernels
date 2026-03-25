@@ -67,9 +67,10 @@ def flash_attention_v2_fp16_kernel(
     directly maps to mma.sync PTX → HMMA on T4. Softmax running state (m, s)
     and output accumulator (acc) stay in fp32 throughout.
 
-    Loop structure mirrors flash_attention_v2:
-    - Loop A: fully-past tiles (kv_start + BLOCK_N <= q_start) — no causal mask.
-    - Loop B: diagonal tiles — causal mask applied per element.
+    Single loop over range(0, q_start + BLOCK_M, BLOCK_N): causal mask applied
+    unconditionally. For past tiles (kv_pos < q_start) the mask is all-True,
+    so there is no correctness cost. The two-loop split is unsound when
+    BLOCK_N > BLOCK_M — a tile with kv_start < q_start can overlap Q.
     """
     batch_id = tl.program_id(0)
     head_id  = tl.program_id(1)
@@ -96,42 +97,15 @@ def flash_attention_v2_fp16_kernel(
     s   = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    # ── Loop A: fully-past K/V tiles — no causal mask needed ─────────────────
-    for kv_start in range(0, q_start, BLOCK_N):
-        kv_offs = kv_start + tl.arange(0, BLOCK_N)
-        kv_mask = kv_offs < N
-
-        # K pre-transposed to (B, H, d, N) in wrapper — load as (BLOCK_D, BLOCK_N)
-        kt = tl.load(
-            k_base + d_offs[:, None] * stride_kn + kv_offs[None, :] * stride_kd,
-            mask=kv_mask[None, :],
-            other=0.0,
-        ).to(tl.float16)
-
-        v = tl.load(
-            v_base + kv_offs[:, None] * stride_vn + d_offs[None, :] * stride_vd,
-            mask=kv_mask[:, None],
-            other=0.0,
-        ).to(tl.float16)
-
-        # Accumulator form → HMMA guaranteed on T4
-        qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        score_tile = tl.dot(q, kt, qk) * scale
-        score_tile = tl.where(kv_mask[None, :], score_tile, float("-inf"))
-
-        tile_max = tl.max(score_tile, axis=1)
-        new_m    = tl.maximum(m, tile_max)
-        alpha    = tl.exp(m - new_m)
-        s        = s * alpha
-        acc      = acc * alpha[:, None]
-
-        exp_scores = tl.exp(score_tile - new_m[:, None])
-        acc = tl.dot(exp_scores.to(tl.float16), v, acc)
-        s   += tl.sum(exp_scores, axis=1)
-        m    = new_m
-
-    # ── Loop B: diagonal K/V tiles — causal mask required ────────────────────
-    for kv_start in range(q_start, q_start + BLOCK_M, BLOCK_N):
+    # ── Single loop over all KV tiles up to and including the current Q tile ────
+    # The two-loop split (range(0, q_start) + range(q_start, q_start+BLOCK_M)) is
+    # only safe when BLOCK_N <= BLOCK_M. When BLOCK_N > BLOCK_M the first loop can
+    # pick up a tile where kv_start < q_start but kv_start + BLOCK_N > q_start,
+    # processing positions that causally overlap Q without applying the causal mask.
+    # Single loop with the causal mask applied unconditionally is correct: for
+    # fully-past tiles every kv_pos < q_start <= q_pos, so the mask is all-True
+    # and adds no overhead beyond a tl.where.
+    for kv_start in range(0, q_start + BLOCK_M, BLOCK_N):
         kv_offs = kv_start + tl.arange(0, BLOCK_N)
         kv_mask = kv_offs < N
 
@@ -152,9 +126,9 @@ def flash_attention_v2_fp16_kernel(
         qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         score_tile = tl.dot(q, kt, qk) * scale
 
+        # Causal + padding mask combined — for past tiles causal_mask is all-True
         causal_mask = q_offs[:, None] >= kv_offs[None, :]
-        score_tile  = tl.where(causal_mask, score_tile, float("-inf"))
-        score_tile  = tl.where(kv_mask[None, :], score_tile, float("-inf"))
+        score_tile  = tl.where(causal_mask & kv_mask[None, :], score_tile, float("-inf"))
 
         tile_max = tl.max(score_tile, axis=1)
         new_m    = tl.maximum(m, tile_max)

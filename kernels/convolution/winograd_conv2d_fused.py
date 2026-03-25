@@ -207,37 +207,37 @@ def winograd_fused_kernel(
         # = x_b_base + ci_offs[k]*stride_xci + (h0[t]+dr)*stride_xh + (w0[t]+dc)*stride_xw
         # Rows differ per tile (non-contiguous in H/W), cols contiguous in C_in.
         d_00 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+0)[:, None]*stride_xh + (w0+0)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0)
         d_01 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+0)[:, None]*stride_xh + (w0+1)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0)
         d_02 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+0)[:, None]*stride_xh + (w0+2)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0)
         d_03 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+0)[:, None]*stride_xh + (w0+3)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+0)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0)
         d_10 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+1)[:, None]*stride_xh + (w0+0)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0)
         d_11 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+1)[:, None]*stride_xh + (w0+1)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0)
         d_12 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+1)[:, None]*stride_xh + (w0+2)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0)
         d_13 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+1)[:, None]*stride_xh + (w0+3)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+1)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0)
         d_20 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+2)[:, None]*stride_xh + (w0+0)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0)
         d_21 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+2)[:, None]*stride_xh + (w0+1)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0)
         d_22 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+2)[:, None]*stride_xh + (w0+2)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0)
         d_23 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+2)[:, None]*stride_xh + (w0+3)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+2)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0)
         d_30 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+3)[:, None]*stride_xh + (w0+0)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+0)<W)[:, None], other=0.0)
         d_31 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+3)[:, None]*stride_xh + (w0+1)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+1)<W)[:, None], other=0.0)
         d_32 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+3)[:, None]*stride_xh + (w0+2)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+2)<W)[:, None], other=0.0)
         d_33 = tl.load(x_b_base + ci_offs[None, :]*stride_xci + (h0+3)[:, None]*stride_xh + (w0+3)[:, None]*stride_xw,
-                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0).to(tl.float16)
+                       mask=tile_mask[:, None] & ci_mask[None, :] & ((h0+3)<H)[:, None] & ((w0+3)<W)[:, None], other=0.0)
 
         # ── 2. Input transform B^T × d × B → 16 V matrices, each (BLOCK_TILES, BLOCK_K) ──
         # Applied element-wise: same arithmetic as the scalar version, now on 2D matrices.
@@ -258,42 +258,47 @@ def winograd_fused_kernel(
         # ci_offs[:, None] × stride_ut_ci broadcasts to (BLOCK_K, BLOCK_CO) address tile.
         u_mask = ci_mask[:, None] & co_mask[None, :]
         u_base = u_t_ptr + ci_offs[:, None] * stride_ut_ci + co_offs[None, :] * stride_ut_co
-        u_0  = tl.load(u_base +  0 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_1  = tl.load(u_base +  1 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_2  = tl.load(u_base +  2 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_3  = tl.load(u_base +  3 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_4  = tl.load(u_base +  4 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_5  = tl.load(u_base +  5 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_6  = tl.load(u_base +  6 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_7  = tl.load(u_base +  7 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_8  = tl.load(u_base +  8 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_9  = tl.load(u_base +  9 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_10 = tl.load(u_base + 10 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_11 = tl.load(u_base + 11 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_12 = tl.load(u_base + 12 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_13 = tl.load(u_base + 13 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_14 = tl.load(u_base + 14 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
-        u_15 = tl.load(u_base + 15 * stride_ut_p, mask=u_mask, other=0.0).to(tl.float16)
+        # U_t is fp32 (weight transform runs in fp32 throughout); keep fp32 here.
+        # Cast to fp16 only at the tl.dot boundary — see step 4.
+        u_0  = tl.load(u_base +  0 * stride_ut_p, mask=u_mask, other=0.0)
+        u_1  = tl.load(u_base +  1 * stride_ut_p, mask=u_mask, other=0.0)
+        u_2  = tl.load(u_base +  2 * stride_ut_p, mask=u_mask, other=0.0)
+        u_3  = tl.load(u_base +  3 * stride_ut_p, mask=u_mask, other=0.0)
+        u_4  = tl.load(u_base +  4 * stride_ut_p, mask=u_mask, other=0.0)
+        u_5  = tl.load(u_base +  5 * stride_ut_p, mask=u_mask, other=0.0)
+        u_6  = tl.load(u_base +  6 * stride_ut_p, mask=u_mask, other=0.0)
+        u_7  = tl.load(u_base +  7 * stride_ut_p, mask=u_mask, other=0.0)
+        u_8  = tl.load(u_base +  8 * stride_ut_p, mask=u_mask, other=0.0)
+        u_9  = tl.load(u_base +  9 * stride_ut_p, mask=u_mask, other=0.0)
+        u_10 = tl.load(u_base + 10 * stride_ut_p, mask=u_mask, other=0.0)
+        u_11 = tl.load(u_base + 11 * stride_ut_p, mask=u_mask, other=0.0)
+        u_12 = tl.load(u_base + 12 * stride_ut_p, mask=u_mask, other=0.0)
+        u_13 = tl.load(u_base + 13 * stride_ut_p, mask=u_mask, other=0.0)
+        u_14 = tl.load(u_base + 14 * stride_ut_p, mask=u_mask, other=0.0)
+        u_15 = tl.load(u_base + 15 * stride_ut_p, mask=u_mask, other=0.0)
 
         # ── 4. tl.dot accumulate: acc_p = acc_p + V_p @ U_p ─────────────────────
+        # V_p and U_p cast to fp16 here — Winograd B^T × d × B computed in fp32
+        # above to avoid cancellation errors; only the GEMM operands become fp16
+        # so the HMMA (tensor core) path is preserved on T4.
         # V_p: (BLOCK_TILES, BLOCK_K), U_p: (BLOCK_K, BLOCK_CO) → (BLOCK_TILES, BLOCK_CO)
-        # tl.dot(A, B, C) = C + A @ B  (fused GEMM with accumulator)
-        acc_0  = tl.dot(v_00, u_0,  acc_0)
-        acc_1  = tl.dot(v_01, u_1,  acc_1)
-        acc_2  = tl.dot(v_02, u_2,  acc_2)
-        acc_3  = tl.dot(v_03, u_3,  acc_3)
-        acc_4  = tl.dot(v_10, u_4,  acc_4)
-        acc_5  = tl.dot(v_11, u_5,  acc_5)
-        acc_6  = tl.dot(v_12, u_6,  acc_6)
-        acc_7  = tl.dot(v_13, u_7,  acc_7)
-        acc_8  = tl.dot(v_20, u_8,  acc_8)
-        acc_9  = tl.dot(v_21, u_9,  acc_9)
-        acc_10 = tl.dot(v_22, u_10, acc_10)
-        acc_11 = tl.dot(v_23, u_11, acc_11)
-        acc_12 = tl.dot(v_30, u_12, acc_12)
-        acc_13 = tl.dot(v_31, u_13, acc_13)
-        acc_14 = tl.dot(v_32, u_14, acc_14)
-        acc_15 = tl.dot(v_33, u_15, acc_15)
+        # tl.dot(A, B, C) = C + A @ B  (fused GEMM with fp32 accumulator)
+        acc_0  = tl.dot(v_00.to(tl.float16), u_0.to(tl.float16),  acc_0)
+        acc_1  = tl.dot(v_01.to(tl.float16), u_1.to(tl.float16),  acc_1)
+        acc_2  = tl.dot(v_02.to(tl.float16), u_2.to(tl.float16),  acc_2)
+        acc_3  = tl.dot(v_03.to(tl.float16), u_3.to(tl.float16),  acc_3)
+        acc_4  = tl.dot(v_10.to(tl.float16), u_4.to(tl.float16),  acc_4)
+        acc_5  = tl.dot(v_11.to(tl.float16), u_5.to(tl.float16),  acc_5)
+        acc_6  = tl.dot(v_12.to(tl.float16), u_6.to(tl.float16),  acc_6)
+        acc_7  = tl.dot(v_13.to(tl.float16), u_7.to(tl.float16),  acc_7)
+        acc_8  = tl.dot(v_20.to(tl.float16), u_8.to(tl.float16),  acc_8)
+        acc_9  = tl.dot(v_21.to(tl.float16), u_9.to(tl.float16),  acc_9)
+        acc_10 = tl.dot(v_22.to(tl.float16), u_10.to(tl.float16), acc_10)
+        acc_11 = tl.dot(v_23.to(tl.float16), u_11.to(tl.float16), acc_11)
+        acc_12 = tl.dot(v_30.to(tl.float16), u_12.to(tl.float16), acc_12)
+        acc_13 = tl.dot(v_31.to(tl.float16), u_13.to(tl.float16), acc_13)
+        acc_14 = tl.dot(v_32.to(tl.float16), u_14.to(tl.float16), acc_14)
+        acc_15 = tl.dot(v_33.to(tl.float16), u_15.to(tl.float16), acc_15)
 
     # ── 5. Output transform A^T × acc × A → 4 output elements per (tile, co) ──
     # acc_p ≡ acc[row][col] where p = row*4 + col
