@@ -8,12 +8,15 @@ References: https://arxiv.org/abs/2307.08691 (Dao, FlashAttention-2, 2023)
 
 Difference from flash_attention_v2.py:
   - Accepts and operates on fp16 tensors natively.
-  - tl.dot uses fp16 operands → tensor core path on T4 (65 TFLOPS peak vs
-    8.1 TFLOPS fp32). The fp32 variant casts inputs to fp32 before launch,
-    which forces CUDA SIMT multiply-adds throughout.
+  - K is pre-transposed in the wrapper to (B, H, d, N), eliminating in-kernel
+    tl.trans. tl.trans on Turing (SM75) can violate HMMA fragment layout.
+  - tl.dot uses accumulator form: tl.dot(fp16, fp16, fp32_acc) → HMMA on T4
+    (65 TFLOPS peak vs 8.1 TFLOPS for the fp32 SIMT path). out_dtype= form
+    may cause Triton to upcast inputs to fp32 before the matmul.
   - Softmax state (running max m, sum s) and accumulator (acc) remain in fp32
     for numerical stability; only the tl.dot operands are fp16.
-  - num_stages added to autotune configs for software pipelining.
+  - num_stages=1 configs added: Turing has limited async copy support;
+    num_stages=2/3 adds shared memory pressure and can cause register spills.
 """
 
 import torch
@@ -27,12 +30,16 @@ import torch.nn.functional as F
 
 @triton.autotune(
     configs=[
+        # num_stages=1 first — Turing has limited async copy; stages add SMEM pressure
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=1),
+        # num_stages=2 — may help at large N if SMEM budget allows
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=2),
         triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},  num_warps=4, num_stages=2),
     ],
     key=["N", "d"],
 )
@@ -52,12 +59,13 @@ def flash_attention_v2_fp16_kernel(
     """
     Flash Attention v2 forward with fp16 tensor core path.
 
-    q, k, v are loaded as fp16 and passed directly to tl.dot with
-    out_dtype=tl.float32. On T4, this maps to the HMMA tensor core
-    instruction (fp16 multiply, fp32 accumulate).
+    K is pre-transposed in the wrapper to (B, H, d, N) and loaded directly
+    as (BLOCK_D, BLOCK_N) — no in-kernel tl.trans. tl.trans on Turing (SM75)
+    can violate HMMA fragment layout, preventing tensor core dispatch.
 
-    Softmax running state (m, s) and output accumulator (acc) stay in fp32
-    throughout — only the tl.dot operands are downcast to fp16.
+    tl.dot uses accumulator form: tl.dot(fp16, fp16, fp32_acc). This form
+    directly maps to mma.sync PTX → HMMA on T4. Softmax running state (m, s)
+    and output accumulator (acc) stay in fp32 throughout.
 
     Loop structure mirrors flash_attention_v2:
     - Loop A: fully-past tiles (kv_start + BLOCK_N <= q_start) — no causal mask.
@@ -93,9 +101,10 @@ def flash_attention_v2_fp16_kernel(
         kv_offs = kv_start + tl.arange(0, BLOCK_N)
         kv_mask = kv_offs < N
 
-        k = tl.load(
-            k_base + kv_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
-            mask=kv_mask[:, None],
+        # K pre-transposed to (B, H, d, N) in wrapper — load as (BLOCK_D, BLOCK_N)
+        kt = tl.load(
+            k_base + d_offs[:, None] * stride_kn + kv_offs[None, :] * stride_kd,
+            mask=kv_mask[None, :],
             other=0.0,
         ).to(tl.float16)
 
@@ -105,8 +114,9 @@ def flash_attention_v2_fp16_kernel(
             other=0.0,
         ).to(tl.float16)
 
-        # fp16 × fp16 → fp32: tensor core path on T4
-        score_tile = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+        # Accumulator form → HMMA guaranteed on T4
+        qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        score_tile = tl.dot(q, kt, qk) * scale
         score_tile = tl.where(kv_mask[None, :], score_tile, float("-inf"))
 
         tile_max = tl.max(score_tile, axis=1)
@@ -116,8 +126,7 @@ def flash_attention_v2_fp16_kernel(
         acc      = acc * alpha[:, None]
 
         exp_scores = tl.exp(score_tile - new_m[:, None])
-        # exp_scores in fp32 → cast to fp16 for tensor core v dot
-        acc += tl.dot(exp_scores.to(tl.float16), v, out_dtype=tl.float32)
+        acc = tl.dot(exp_scores.to(tl.float16), v, acc)
         s   += tl.sum(exp_scores, axis=1)
         m    = new_m
 
@@ -126,9 +135,10 @@ def flash_attention_v2_fp16_kernel(
         kv_offs = kv_start + tl.arange(0, BLOCK_N)
         kv_mask = kv_offs < N
 
-        k = tl.load(
-            k_base + kv_offs[:, None] * stride_kn + d_offs[None, :] * stride_kd,
-            mask=kv_mask[:, None],
+        # K pre-transposed to (B, H, d, N) in wrapper — load as (BLOCK_D, BLOCK_N)
+        kt = tl.load(
+            k_base + d_offs[:, None] * stride_kn + kv_offs[None, :] * stride_kd,
+            mask=kv_mask[None, :],
             other=0.0,
         ).to(tl.float16)
 
@@ -138,7 +148,9 @@ def flash_attention_v2_fp16_kernel(
             other=0.0,
         ).to(tl.float16)
 
-        score_tile = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+        # Accumulator form → HMMA guaranteed on T4
+        qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        score_tile = tl.dot(q, kt, qk) * scale
 
         causal_mask = q_offs[:, None] >= kv_offs[None, :]
         score_tile  = tl.where(causal_mask, score_tile, float("-inf"))
@@ -151,7 +163,7 @@ def flash_attention_v2_fp16_kernel(
         acc      = acc * alpha[:, None]
 
         exp_scores = tl.exp(score_tile - new_m[:, None])
-        acc += tl.dot(exp_scores.to(tl.float16), v, out_dtype=tl.float32)
+        acc = tl.dot(exp_scores.to(tl.float16), v, acc)
         s   += tl.sum(exp_scores, axis=1)
         m    = new_m
 
@@ -185,9 +197,9 @@ def flash_attention_v2_fp16(
     assert q.shape == k.shape == v.shape, "q, k, v must have the same shape"
     assert q.dtype == torch.float16, f"Expected fp16 inputs, got {q.dtype}"
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    q   = q.contiguous()
+    k_t = k.transpose(-2, -1).contiguous()   # (B, H, d, N) — no in-kernel tl.trans needed
+    v   = v.contiguous()
 
     B, H, N, d = q.shape
     assert d & (d - 1) == 0, f"d must be a power of 2, got {d}"
@@ -199,10 +211,10 @@ def flash_attention_v2_fp16(
     grid = lambda meta: (B, H, triton.cdiv(N, meta["BLOCK_M"]))
 
     flash_attention_v2_fp16_kernel[grid](
-        q, k, v, out,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        q, k_t, v, out,
+        q.stride(0),   q.stride(1),   q.stride(2),   q.stride(3),
+        k_t.stride(0), k_t.stride(1), k_t.stride(2), k_t.stride(3),
+        v.stride(0),   v.stride(1),   v.stride(2),   v.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         N, d,
         scale,
