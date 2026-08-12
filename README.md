@@ -1,6 +1,6 @@
 # Triton Kernels
 
-22 GPU kernels written in [Triton](https://triton-lang.org), organized into 7 phases from elementwise ops to Flash Attention v2. Each kernel includes a correctness test against the PyTorch equivalent and a benchmark reporting GB/s (memory-bound) or TFLOPS (compute-bound).
+23 GPU kernels written in [Triton](https://triton-lang.org), organized into 7 phases from elementwise ops to Flash Attention v2. Each kernel includes a correctness test against the PyTorch equivalent and a benchmark reporting GB/s (memory-bound) or TFLOPS (compute-bound).
 
 All benchmarks run on NVIDIA Tesla T4 (Google Colab Pro).
 
@@ -95,16 +95,17 @@ Flash Attention v2 keeps the running (max, sum) state in registers, accumulating
 | Conv1d | `kernels/convolution/conv1d.py` | `F.conv1d` | Implicit GEMM; 9% gap vs cuDNN at N=131072 |
 | Conv2d | `kernels/convolution/conv2d.py` | `F.conv2d` | 2D spatial tiling; weight transposed to (C_out, K, K, C_in) for contiguous loads |
 | Depthwise conv2d | `kernels/convolution/depthwise_conv2d.py` | `F.conv2d(..., groups=C)` | Per-channel sliding window; within 15% of PyTorch everywhere |
+| Winograd conv2d | `kernels/convolution/winograd_conv2d.py` | `F.conv2d` (K=3) | Winograd F(2,3); 16 pointwise multiplies per tile vs 36 for direct |
 
 **Conv2d results (B=1, C_in=C_out=64, K=3, fp32):**
 
-| H | Triton | PyTorch |
+| H | Triton direct | PyTorch |
 |---|---|---|
 | 128 | 4.27 TFLOPS | 6.79 TFLOPS |
 | 256 | 4.32 TFLOPS | 5.96 TFLOPS |
 | 512 | 3.97 TFLOPS | 5.14 TFLOPS |
 
-The 1.3–1.6× gap at H≥128 is algorithmic: cuDNN selects Winograd F(2,3) for K=3 stride-1, reducing the multiply count ~2.25× vs direct convolution. The TFLOPS metric counts standard direct-conv FLOPs for both providers, so cuDNN's fewer operations appear as higher throughput.
+The 1.3–1.6× gap between Triton direct and PyTorch (cuDNN) is algorithmic: cuDNN selects Winograd F(2,3) for K=3 stride-1, reducing the multiply count ~2.25× vs direct convolution. `winograd_conv2d` implements the same algorithm as an unfused three-stage pipeline (input/weight transform → GEMM → output transform). It validates the transform math (max_err ≤ 2e-5 across 8 shapes) but reaches only 0.15–0.22 TFLOPS: the two HBM-resident intermediates (V_t, M_t — ~66 MB each at H=256) round-trip through global memory, so the multiply saving never surfaces. It stands as the correctness baseline for a fused single-kernel version that keeps the intermediates in registers.
 
 Depthwise conv has arithmetic intensity ~1.8 FLOPs/byte (K=3, fp32) — well below T4's ridge point of 25 FLOPs/byte — so both Triton and PyTorch are HBM-bandwidth-limited. The 0.27 TFLOPS plateau corresponds to ~150 GB/s effective bandwidth (~63% of the elementwise ceiling). The low TFLOPS number is an artefact of the metric, not a sign of inefficiency.
 
