@@ -67,8 +67,6 @@ def naive_attention_kernel(
     # multiply by V.  Because N fits in registers for small N, we hold the
     # full [BLOCK_N, N] score matrix in registers.
 
-    # Pass 1: accumulate scores and track per-row max (for numerical stability)
-    scores = tl.zeros([BLOCK_N, 1], dtype=tl.float32)  # placeholder shape
     # We can't dynamically size a register array by N at runtime.
     # Instead we loop over K tiles and do online softmax (max + sum tracked).
 
@@ -148,7 +146,8 @@ def naive_attention(
 
     Args:
         q, k, v: Tensors of shape (B, H, N, d), fp32 or fp16.
-                 d must be a power of 2; N must be divisible by BLOCK_N.
+                 d must be a power of 2; N can be any length — the kernel masks
+                 the final partial tile in both the query and key/value loops.
                  N <= 2048 recommended (register pressure).
 
     Returns:

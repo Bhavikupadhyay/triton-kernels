@@ -107,7 +107,12 @@ def cummax(x: torch.Tensor) -> torch.Tensor:
     n = x.numel()
     num_blocks = triton.cdiv(n, BLOCK_SIZE)
 
-    out = x.to(torch.float32)
+    # copy=True is required: pass 1 and pass 3 scan in-place over `out`. Plain
+    # x.to(torch.float32) is a no-op alias when x is already fp32 (torch
+    # semantics), which would overwrite the caller's tensor and return an alias
+    # of it. copy=True always allocates a fresh buffer (fp16 input already
+    # copies during the cast, so this adds no second copy there).
+    out = x.to(torch.float32, copy=True)
     block_maxes = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
 
     cummax_pass1[(num_blocks,)](out, out, block_maxes, n, BLOCK_SIZE=BLOCK_SIZE)
@@ -130,9 +135,15 @@ def test_cummax():
     ]
     for n in sizes:
         x = torch.randn(n, device="cuda", dtype=torch.float32)
+        x_before = x.clone()                 # snapshot to prove the input is untouched
         ref = torch.cummax(x, dim=0).values
         got = cummax(x)
         torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+        # Regression guard for the input-aliasing bug: the result must be a
+        # fresh allocation and the caller's tensor must be bit-identical after.
+        assert got.data_ptr() != x.data_ptr(), "cummax returned an alias of its input"
+        torch.testing.assert_close(x, x_before, rtol=0, atol=0)
 
     print("test_cummax: PASSED")
 
