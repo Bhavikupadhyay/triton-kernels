@@ -167,6 +167,10 @@ def prefix_sum(x: torch.Tensor) -> torch.Tensor:
     inclusive = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
     counter  = torch.zeros(1,          device=x.device, dtype=torch.int32)
 
+    # x.float() aliases x when x is already fp32 (torch semantics), but that is
+    # safe here: the kernel only reads this operand — it never writes back into
+    # it (output goes to the separate `out` buffer). cummax needs copy=True
+    # because its passes scan in-place.
     prefix_sum_dlb_kernel[(num_blocks,)](
         x.float(), out,
         flags, partial, inclusive, counter,

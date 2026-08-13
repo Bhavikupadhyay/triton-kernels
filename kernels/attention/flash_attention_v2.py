@@ -16,11 +16,17 @@ import torch.nn.functional as F
 
 # ── Kernel ────────────────────────────────────────────────────────────────────
 
+# Invariant: BLOCK_N <= BLOCK_M. Loop A processes fully-past K/V tiles with no
+# causal mask, which is only correct when a Loop-A tile cannot straddle the
+# diagonal — i.e. when BLOCK_N <= BLOCK_M. With BLOCK_N > BLOCK_M a Loop-A tile
+# (kv_start in range(0, q_start, BLOCK_N)) can extend past q_start and attend to
+# future keys unmasked, and Loop B (range(q_start, q_start+BLOCK_M, BLOCK_N))
+# then re-processes the overlapping keys — double-counting them. Any config with
+# BLOCK_N > BLOCK_M is therefore unsound and must not appear below.
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4),
     ],
     key=["N", "d"],

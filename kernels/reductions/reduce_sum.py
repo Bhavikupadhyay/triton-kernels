@@ -51,15 +51,28 @@ def reduce_partials_kernel(
     partial_ptr,
     out_ptr,
     num_blocks: int,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,   # chunk width — capped at CHUNK in the wrapper
 ):
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < num_blocks
-    x = tl.load(partial_ptr + offs, mask=mask, other=0.0)
-    tl.store(out_ptr, tl.sum(x, axis=0))
+    # Chunked accumulation: tl.arange stays bounded to BLOCK_SIZE (<= CHUNK)
+    # instead of growing to next_power_of_2(num_blocks). At n=2**28 the old
+    # single-tile version needed a 2**18-wide arange → register/resource
+    # exhaustion; here the tile is fixed and the loop runs
+    # tl.cdiv(num_blocks, BLOCK_SIZE) times, keeping register pressure flat.
+    acc = 0.0
+    for chunk_start in range(0, num_blocks, BLOCK_SIZE):
+        offs = chunk_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < num_blocks
+        x = tl.load(partial_ptr + offs, mask=mask, other=0.0)
+        acc += tl.sum(x, axis=0)
+    tl.store(out_ptr, acc)
 
 
 # ── 2. Python wrapper ─────────────────────────────────────────────────────────
+
+# Pass-2 tile cap. 4096 fp32 partials = 16 KB — well within SMEM/registers —
+# and keeps tl.arange bounded so the pass-2 kernel's register footprint does not
+# scale with num_blocks. Anything larger is handled by the pass-2 chunk loop.
+CHUNK = 4096
 
 def reduce_sum(x: torch.Tensor) -> torch.Tensor:
     assert x.is_cuda, "Input must be on CUDA"
@@ -72,9 +85,9 @@ def reduce_sum(x: torch.Tensor) -> torch.Tensor:
     partials = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
     reduce_sum_kernel[(num_blocks,)](x, partials, n, BLOCK_SIZE=BLOCK_SIZE)
 
-    # Pass 2: sum the partials in a single block.
-    # next_power_of_2 gives a valid tl.constexpr that covers all partials.
-    block2 = triton.next_power_of_2(num_blocks)
+    # Pass 2: sum the partials in a single program, chunked. The tile is capped
+    # at CHUNK; num_blocks beyond that is covered by the in-kernel chunk loop.
+    block2 = min(triton.next_power_of_2(num_blocks), CHUNK)
     out = torch.empty(1, device=x.device, dtype=torch.float32)
     reduce_partials_kernel[(1,)](partials, out, num_blocks, BLOCK_SIZE=block2)
 
@@ -84,7 +97,10 @@ def reduce_sum(x: torch.Tensor) -> torch.Tensor:
 # ── 3. Correctness tests ──────────────────────────────────────────────────────
 
 def test_reduce_sum():
-    sizes = [1, 127, 128, 1024, 1025, 65536, 100_000, 1_000_000]
+    # n=2**24 (num_blocks=16384 > CHUNK) exercises the chunked pass-2 loop. The
+    # shipped benchmark reaches n=2**28 — the regression target for the old
+    # single-tile arange resource exhaustion — validated on Colab, not here.
+    sizes = [1, 127, 128, 1024, 1025, 65536, 100_000, 1_000_000, 2**24]
     dtypes = [torch.float32, torch.float16]
 
     for dtype in dtypes:

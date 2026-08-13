@@ -55,17 +55,28 @@ def argmax_partials_kernel(
     out_val_ptr,
     out_idx_ptr,
     num_blocks: int,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,   # chunk width — capped at CHUNK in the wrapper
 ):
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < num_blocks
-    vals = tl.load(val_ptr + offs, mask=mask, other=-float("inf"))
-    idxs = tl.load(idx_ptr + offs, mask=mask, other=0)
-    global_max = tl.max(vals, axis=0)
-    # Recover the index: among all blocks whose val equals global_max, take argmax
-    local_idx = tl.argmax(vals, axis=0)
-    tl.store(out_val_ptr, global_max)
-    tl.store(out_idx_ptr, tl.load(idx_ptr + local_idx))
+    # Chunked scan of the per-block (value, index) pairs. tl.arange stays bounded
+    # to BLOCK_SIZE (<= CHUNK) instead of next_power_of_2(num_blocks), so the
+    # register footprint does not scale with num_blocks (the 2**28 resource
+    # exhaustion). Running best value + its absolute stored index carry across
+    # chunks. Strict `>` keeps the earliest chunk's winner on ties, matching the
+    # old single-tile tl.argmax (lowest block index → first occurrence overall).
+    best_val = -float("inf")
+    best_idx = tl.zeros([], dtype=tl.int64)
+    for chunk_start in range(0, num_blocks, BLOCK_SIZE):
+        offs = chunk_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < num_blocks
+        vals = tl.load(val_ptr + offs, mask=mask, other=-float("inf"))
+        chunk_max = tl.max(vals, axis=0)
+        chunk_pos = tl.argmax(vals, axis=0)                     # position in chunk
+        chunk_idx = tl.load(idx_ptr + chunk_start + chunk_pos)  # absolute index
+        take = chunk_max > best_val
+        best_idx = tl.where(take, chunk_idx, best_idx)
+        best_val = tl.where(take, chunk_max, best_val)
+    tl.store(out_val_ptr, best_val)
+    tl.store(out_idx_ptr, best_idx)
 
 
 @triton.jit
@@ -93,19 +104,33 @@ def argmin_partials_kernel(
     out_val_ptr,
     out_idx_ptr,
     num_blocks: int,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,   # chunk width — capped at CHUNK in the wrapper
 ):
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < num_blocks
-    vals = tl.load(val_ptr + offs, mask=mask, other=float("inf"))
-    idxs = tl.load(idx_ptr + offs, mask=mask, other=0)
-    global_min = tl.min(vals, axis=0)
-    local_idx = tl.argmin(vals, axis=0)
-    tl.store(out_val_ptr, global_min)
-    tl.store(out_idx_ptr, tl.load(idx_ptr + local_idx))
+    # Chunked scan, mirror of argmax_partials_kernel. Running best (min) value +
+    # its absolute stored index carry across chunks; strict `<` keeps the
+    # earliest chunk's winner on ties (first occurrence overall).
+    best_val = float("inf")
+    best_idx = tl.zeros([], dtype=tl.int64)
+    for chunk_start in range(0, num_blocks, BLOCK_SIZE):
+        offs = chunk_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < num_blocks
+        vals = tl.load(val_ptr + offs, mask=mask, other=float("inf"))
+        chunk_min = tl.min(vals, axis=0)
+        chunk_pos = tl.argmin(vals, axis=0)                     # position in chunk
+        chunk_idx = tl.load(idx_ptr + chunk_start + chunk_pos)  # absolute index
+        take = chunk_min < best_val
+        best_idx = tl.where(take, chunk_idx, best_idx)
+        best_val = tl.where(take, chunk_min, best_val)
+    tl.store(out_val_ptr, best_val)
+    tl.store(out_idx_ptr, best_idx)
 
 
 # ── 2. Python wrappers ────────────────────────────────────────────────────────
+
+# Pass-2 tile cap. 4096 fp32 partials = 16 KB — well within SMEM/registers — and
+# keeps tl.arange bounded so the pass-2 kernel's register footprint does not
+# scale with num_blocks. Beyond CHUNK, the pass-2 chunk loop iterates.
+CHUNK = 4096
 
 def _reduce(val_kernel, part_kernel, x: torch.Tensor, fill: float):
     assert x.is_cuda, "Input must be on CUDA"
@@ -113,7 +138,8 @@ def _reduce(val_kernel, part_kernel, x: torch.Tensor, fill: float):
     n = x.numel()
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(n, BLOCK_SIZE)
-    block2 = triton.next_power_of_2(num_blocks)
+    # Cap the pass-2 tile at CHUNK; larger num_blocks is covered by the loop.
+    block2 = min(triton.next_power_of_2(num_blocks), CHUNK)
 
     part_vals = torch.empty(num_blocks, device=x.device, dtype=torch.float32)
     part_idxs = torch.empty(num_blocks, device=x.device, dtype=torch.int64)
@@ -137,7 +163,10 @@ def argmin(x: torch.Tensor):
 # ── 3. Correctness tests ──────────────────────────────────────────────────────
 
 def test_max_min():
-    sizes = [1, 127, 128, 1024, 1025, 65536, 100_000, 1_000_000]
+    # n=2**24 (num_blocks=16384 > CHUNK) exercises the chunked pass-2 loop. The
+    # shipped benchmark reaches n=2**28 — the regression target for the old
+    # single-tile arange resource exhaustion — validated on Colab, not here.
+    sizes = [1, 127, 128, 1024, 1025, 65536, 100_000, 1_000_000, 2**24]
     dtypes = [torch.float32, torch.float16]
 
     for dtype in dtypes:
